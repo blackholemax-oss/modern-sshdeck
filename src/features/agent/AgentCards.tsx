@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
+import { useTranslation } from "react-i18next";
+
 import { Badge } from "@/components/ui/badge";
 import { api, events } from "@/shared/api";
 import { useAgentStore } from "@/stores/agent";
@@ -15,6 +17,7 @@ export function ToolCallCard({
   output?: string;
   ok?: boolean;
 }) {
+  const { t } = useTranslation();
   let command = args;
   try {
     const parsed = JSON.parse(args) as { command?: string };
@@ -30,11 +33,11 @@ export function ToolCallCard({
           {name}
         </Badge>
         {ok === undefined ? (
-          <Badge variant="outline">执行中…</Badge>
+          <Badge variant="outline">{t("approval.running")}</Badge>
         ) : ok ? (
-          <Badge variant="success">成功</Badge>
+          <Badge variant="success">{t("approval.success")}</Badge>
         ) : (
-          <Badge variant="destructive">失败</Badge>
+          <Badge variant="destructive">{t("approval.failed")}</Badge>
         )}
       </div>
       <pre className="mb-1 overflow-x-auto rounded bg-background/60 px-2 py-1 font-mono text-[11px] text-foreground/80">
@@ -54,6 +57,7 @@ const CONFIRM_PHRASE = "确认执行";
 
 /** 审批卡片：变更/高危命令的人工放行闸门。 */
 export function ApprovalCard() {
+  const { t } = useTranslation();
   const approval = useAgentStore((s) => s.approval);
   const setApproval = useAgentStore((s) => s.setApproval);
   const sendApproval = useAgentStore((s) => s.sendApproval);
@@ -68,9 +72,9 @@ export function ApprovalCard() {
   const phraseOk = !isDangerous || phrase.trim() === CONFIRM_PHRASE;
 
   const riskBadge = isDangerous ? (
-    <Badge variant="destructive">高危命令</Badge>
+    <Badge variant="destructive">{t("approval.dangerousCommand")}</Badge>
   ) : (
-    <Badge variant="outline">变更操作</Badge>
+    <Badge variant="outline">{t("approval.mutating")}</Badge>
   );
 
   const decide = (approved: boolean) => {
@@ -84,7 +88,7 @@ export function ApprovalCard() {
     <div className="mt-3 rounded-lg border-2 border-destructive/50 bg-destructive/5 p-3">
       <div className="mb-2 flex items-center gap-2">
         {riskBadge}
-        <span className="text-xs text-muted-foreground">需要人工确认</span>
+        <span className="text-xs text-muted-foreground">{t("approval.needsConfirm")}</span>
       </div>
       <pre className="mb-2 overflow-x-auto rounded bg-background/70 px-2 py-1.5 font-mono text-xs">
         {approval.command}
@@ -119,7 +123,7 @@ export function ApprovalCard() {
           className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
           onClick={() => decide(true)}
         >
-          {isDangerous ? "确认执行" : "允许一次"}
+          {isDangerous ? t("approval.confirmExecution") : t("approval.allowOnce")}
         </button>
         <button
           type="button"

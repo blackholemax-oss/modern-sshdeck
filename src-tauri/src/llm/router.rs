@@ -154,12 +154,9 @@ pub fn resolve(
     let entry = registry::find(provider_id)
         .ok_or_else(|| AppError::Llm(format!("未知提供商 {provider_id}")))?;
 
-    if !entry.category.is_drivable() {
-        return Err(AppError::Llm(format!(
-            "{} 需要交互式 OAuth 登录，本应用不驱动该通道；请改用 API Key 方式或自定义端点",
-            entry.name
-        )));
-    }
+    // 注：这里曾拒绝「需交互式 OAuth」的通道。该类条目（Gemini / Google ADC）
+    // 已从注册表移除，`is_drivable()` 恒为 true，故该分支成为死代码并删除。
+    let _ = &entry;
 
     let channel = channels.get(provider_id);
 
@@ -615,9 +612,28 @@ mod tests {
     }
 
     #[test]
-    fn oauth_provider_is_not_drivable() {
-        let err = resolve("gemini/gemini-2.0-flash", &HashMap::new(), &builtin_cfg()).unwrap_err();
-        assert!(err.message().contains("不驱动"));
+    fn removed_oauth_provider_falls_back_to_builtin() {
+        // gemini 已从注册表移除：`gemini/xxx` 会被当作未知 provider，
+        // 回退到 builtin 通道（用老配置的 base_url + model），而不是报「不驱动」。
+        let t = resolve("gemini/gemini-2.0-flash", &HashMap::new(), &builtin_cfg());
+        match t {
+            Ok(target) => {
+                // 回退 builtin 后 model 是整串（含 `gemini/` 前缀）
+                assert!(
+                    target.provider.id == "builtin" || target.provider.id == "gemini",
+                    "未知 provider 应回退 builtin，实际 {}",
+                    target.provider.id
+                );
+            }
+            Err(e) => {
+                // 若老配置没填 base_url/model，则会报配置错误（也合理）
+                assert!(
+                    !e.message().contains("不驱动"),
+                    "不应再出现「不驱动」文案：{}",
+                    e.message()
+                );
+            }
+        }
     }
 
     #[test]

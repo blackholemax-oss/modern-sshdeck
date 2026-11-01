@@ -27,8 +27,6 @@ pub enum ProviderCategory {
     FreeTier,
     /// 需付费 Key。
     ApiKey,
-    /// 需交互式登录 → 只列出，标注「不可驱动」。
-    OAuth,
 }
 
 impl ProviderCategory {
@@ -39,18 +37,16 @@ impl ProviderCategory {
             ProviderCategory::Free => "free",
             ProviderCategory::FreeTier => "free_tier",
             ProviderCategory::ApiKey => "api_key",
-            ProviderCategory::OAuth => "oauth",
         }
     }
 
-    /// 展示顺序：本机 → 免费 → 免费层 → Key → OAuth。
+    /// 展示顺序：本机 → 免费 → 免费层 → Key。
     pub fn rank(self) -> u8 {
         match self {
             ProviderCategory::Local => 0,
             ProviderCategory::Free => 1,
             ProviderCategory::FreeTier => 2,
             ProviderCategory::ApiKey => 3,
-            ProviderCategory::OAuth => 4,
         }
     }
 
@@ -61,14 +57,15 @@ impl ProviderCategory {
             ProviderCategory::Free => "免费通道",
             ProviderCategory::FreeTier => "免费额度",
             ProviderCategory::ApiKey => "API Key",
-            ProviderCategory::OAuth => "OAuth 登录",
         }
     }
 
     /// 该分类是否可被本应用直接驱动（发起对话）。
-    /// OAuth 类只列出、不驱动（契约 §3.1）。
+    ///
+    /// 现在所有分类都可驱动：需要交互式 OAuth 的条目（Gemini / Google ADC）
+    /// 已从注册表移除，因此这里恒为 true。
     pub fn is_drivable(self) -> bool {
-        !matches!(self, ProviderCategory::OAuth)
+        true
     }
 }
 
@@ -479,25 +476,6 @@ pub const PROVIDERS: &[ProviderEntry] = &[
         docs_url: None,
         note: Some("第三方聚合；端点本机不可达，base_url 需手工覆盖。"),
     },
-    // ───────────────────────── OAuth（只列出，不可驱动）─────────────────────────
-    ProviderEntry {
-        id: "gemini",
-        name: "Google Gemini",
-        category: ProviderCategory::OAuth,
-        base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
-        auth: AuthKind::Bearer,
-        docs_url: None,
-        note: Some("需 Google 账号交互式登录（OAuth），本应用只列出不驱动；可用 API Key 走兼容端点。"),
-    },
-    ProviderEntry {
-        id: "google-adc",
-        name: "Google ADC",
-        category: ProviderCategory::OAuth,
-        base_url: None,
-        auth: AuthKind::Bearer,
-        docs_url: None,
-        note: Some("Application Default Credentials，依赖本机 gcloud 登录态，只列出不驱动。"),
-    },
     // ──────────────── Kilo（免 Key 免费池，真实可用）────────────────
     ProviderEntry {
         id: "kilo",
@@ -540,7 +518,6 @@ pub fn grouped() -> Vec<(ProviderCategory, Vec<&'static ProviderEntry>)> {
         ProviderCategory::Free,
         ProviderCategory::FreeTier,
         ProviderCategory::ApiKey,
-        ProviderCategory::OAuth,
     ];
     cats.sort_by_key(|c| c.rank());
     cats.into_iter()
@@ -560,10 +537,12 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn registry_has_at_least_forty_providers() {
-        assert!(
-            PROVIDERS.len() >= 40,
-            "注册表至少 40 家，实际 {}",
+    fn registry_has_expected_provider_count() {
+        // 移除 Gemini / Google ADC（需交互式 OAuth）后为 39 家。
+        assert_eq!(
+            PROVIDERS.len(),
+            39,
+            "注册表应为 39 家，实际 {}",
             PROVIDERS.len()
         );
     }
@@ -639,7 +618,6 @@ mod tests {
             ProviderCategory::Free, // Kilo 免费池
             ProviderCategory::FreeTier,
             ProviderCategory::ApiKey,
-            ProviderCategory::OAuth,
         ] {
             assert!(
                 !by_category(cat).is_empty(),
@@ -670,13 +648,38 @@ mod tests {
     }
 
     #[test]
-    fn oauth_category_is_not_drivable() {
-        assert!(!ProviderCategory::OAuth.is_drivable());
-        assert!(ProviderCategory::Local.is_drivable());
-        for p in by_category(ProviderCategory::OAuth) {
+    fn oauth_providers_are_removed() {
+        // 需要交互式 OAuth 登录的条目（Gemini / Google ADC）已从注册表移除：
+        // 本应用无法驱动它们，列在界面上只会误导用户。
+        assert!(
+            find("gemini").is_none(),
+            "Google Gemini 应已移除（需交互式 OAuth）"
+        );
+        assert!(
+            find("google-adc").is_none(),
+            "Google ADC 应已移除（依赖本机 gcloud 登录态）"
+        );
+
+        // 现在每个分类都可被直接驱动：不存在「列出来但不能用」的条目。
+        for cat in [
+            ProviderCategory::Local,
+            ProviderCategory::Free,
+            ProviderCategory::FreeTier,
+            ProviderCategory::ApiKey,
+        ] {
             assert!(
-                p.note.unwrap_or("").contains("不驱动") || p.note.unwrap_or("").contains("列出"),
-                "{} 是 OAuth 类，note 必须标注不可驱动",
+                cat.is_drivable(),
+                "分类 {:?} 应可驱动（OAuth 类已移除）",
+                cat
+            );
+        }
+
+        // 注册表里不允许出现任何「不驱动 / 只列出」的说明文案
+        for p in PROVIDERS {
+            let note = p.note.unwrap_or("");
+            assert!(
+                !note.contains("不驱动") && !note.contains("只列出"),
+                "{} 仍带有不可驱动文案：{note}",
                 p.id
             );
         }

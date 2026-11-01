@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { api, SshdeckError } from "@/shared/api";
 import type { AuditEntryDto, CompressionStatsDto } from "@/shared/ipc";
+import { useTranslation } from "react-i18next";
 
 /** 字节数的可读格式。 */
 function fmtBytes(n: number): string {
@@ -22,22 +23,23 @@ function fmtBytes(n: number): string {
 
 const DECISION_META: Record<
   AuditEntryDto["decision"],
-  { label: string; variant: "default" | "secondary" | "destructive" | "outline" | "success" }
+  { labelKey: string; variant: "default" | "secondary" | "destructive" | "outline" | "success" }
 > = {
-  auto: { label: "自动执行", variant: "secondary" },
-  approved: { label: "已批准", variant: "success" },
-  rejected: { label: "已拒绝", variant: "destructive" },
-  timeout: { label: "超时", variant: "outline" },
-  aborted: { label: "已中止", variant: "outline" },
+  auto: { labelKey: "settings.token.audit.auto", variant: "secondary" },
+  approved: { labelKey: "settings.token.audit.approved", variant: "success" },
+  rejected: { labelKey: "settings.token.audit.rejected", variant: "destructive" },
+  timeout: { labelKey: "settings.token.audit.timeout", variant: "outline" },
+  aborted: { labelKey: "settings.token.audit.aborted", variant: "outline" },
 };
 
-const RISK_META: Record<string, { label: string; icon: React.ReactNode; cls: string }> = {
-  read_only: { label: "只读", icon: <ShieldCheck className="size-3" />, cls: "text-emerald-500" },
-  mutating: { label: "变更", icon: <ShieldQuestion className="size-3" />, cls: "text-amber-500" },
-  dangerous: { label: "高危", icon: <ShieldAlert className="size-3" />, cls: "text-destructive" },
+const RISK_META: Record<string, { labelKey: string; icon: React.ReactNode; cls: string }> = {
+  read_only: { labelKey: "settings.token.risk.readOnly", icon: <ShieldCheck className="size-3" />, cls: "text-emerald-500" },
+  mutating: { labelKey: "settings.token.risk.mutating", icon: <ShieldQuestion className="size-3" />, cls: "text-amber-500" },
+  dangerous: { labelKey: "settings.token.risk.dangerous", icon: <ShieldAlert className="size-3" />, cls: "text-destructive" },
 };
 
 export function TokenPanel() {
+  const { t } = useTranslation();
   const [stats, setStats] = useState<CompressionStatsDto | null>(null);
   const [audits, setAudits] = useState<AuditEntryDto[]>([]);
   const [count, setCount] = useState(0);
@@ -79,7 +81,7 @@ export function TokenPanel() {
       {/* 压缩统计 */}
       <section className="space-y-2">
         <div className="flex items-center justify-between">
-          <h4 className="text-xs font-semibold">工具输出压缩（RTK）</h4>
+          <h4 className="text-xs font-semibold">{t("settings.token.title")}</h4>
           <div className="flex items-center gap-1">
             <Button variant="ghost" size="sm" onClick={() => void reload()}>
               <RefreshCw className="size-3.5" />
@@ -87,7 +89,7 @@ export function TokenPanel() {
             <Button
               variant="ghost"
               size="sm"
-              title="重置统计"
+              title={t("settings.token.resetStats")}
               onClick={async () => {
                 await api.tokenStatsReset();
                 void reload();
@@ -102,24 +104,24 @@ export function TokenPanel() {
           <>
             <div className="flex items-baseline gap-2">
               <span className="text-2xl font-semibold tabular-nums">{ratioPct}%</span>
-              <span className="text-[11px] text-muted-foreground">已节省</span>
+              <span className="text-[11px] text-muted-foreground">{t("settings.token.saved")}</span>
             </div>
             <div className="grid grid-cols-2 gap-2 text-[11px]">
-              <Stat label="压缩前" value={fmtBytes(stats.beforeBytes)} />
-              <Stat label="压缩后" value={fmtBytes(stats.afterBytes)} />
-              <Stat label="节省" value={fmtBytes(stats.savedBytes)} />
-              <Stat label="压缩块数" value={`${stats.blocksCompressed} / ${stats.calls} 次`} />
+              <Stat label={t("settings.token.beforeAfter")} value={fmtBytes(stats.beforeBytes)} />
+              <Stat label={t("settings.token.after")} value={fmtBytes(stats.afterBytes)} />
+              <Stat label={t("settings.token.savedAmount")} value={fmtBytes(stats.savedBytes)} />
+              <Stat label={t("settings.token.compressedBlocks")} value={`${stats.blocksCompressed} / ${stats.calls}`} />
             </div>
           </>
         ) : (
           <p className="text-[11px] text-muted-foreground">
-            还没有压缩记录。Agent 执行工具后，大输出会自动被压缩以节省 token。
+            {t("settings.token.noStats")}
           </p>
         )}
 
         <p className="text-[10px] leading-relaxed text-muted-foreground">
-          规则：报错输出永不压缩；小于 2 KB 不处理；压缩后更大则回退；整条管线幂等。
-          压缩只影响送模型的上下文，界面里显示给你的仍是原始输出。
+          {t("settings.token.rules")}
+          {t("settings.token.displayNote")}
         </p>
       </section>
 
@@ -129,7 +131,7 @@ export function TokenPanel() {
       <section className="space-y-2">
         <div className="flex items-center justify-between">
           <h4 className="text-xs font-semibold">
-            审批审计 <span className="text-muted-foreground">({count})</span>
+            {t("settings.token.auditTitle")} <span className="text-muted-foreground">({count})</span>
           </h4>
           <Button variant="ghost" size="sm" onClick={() => void reload()}>
             <RefreshCw className="size-3.5" />
@@ -138,7 +140,7 @@ export function TokenPanel() {
 
         {audits.length === 0 ? (
           <p className="text-[11px] text-muted-foreground">
-            还没有审批记录。Agent 执行命令后，每次放行/拒绝都会留痕。
+            {t("settings.token.auditEmpty")}
           </p>
         ) : (
           <div className="space-y-1">
@@ -162,8 +164,8 @@ export function TokenPanel() {
                   >
                     <div className="flex items-center gap-1.5">
                       <span className={risk.cls}>{risk.icon}</span>
-                      <span className="text-muted-foreground">{risk.label}</span>
-                      <Badge variant={dec.variant}>{dec.label}</Badge>
+                      <span className="text-muted-foreground">{risk.labelKey ? t(risk.labelKey) : ""}</span>
+                      <Badge variant={dec.variant}>{dec.labelKey ? t(dec.labelKey) : ""}</Badge>
                       <span className="ml-auto font-mono text-[10px] text-muted-foreground">
                         {new Date(a.ts).toLocaleTimeString()}
                       </span>

@@ -8,10 +8,13 @@ import { useAgentStore } from "@/stores/agent";
 import { useSessionsStore } from "@/stores/sessions";
 
 import { ApprovalCard, ToolCallCard, useAgentEventBridge } from "./AgentCards";
+import { useTranslation } from "react-i18next";
+import { MarkdownMessage } from "./MarkdownMessage";
 
 const RUN_ID = "default-run";
 
 export function AgentPanel() {
+  const { t } = useTranslation();
   useAgentEventBridge();
 
   const messages = useAgentStore((s) => s.messages);
@@ -40,7 +43,7 @@ export function AgentPanel() {
     const text = input.trim();
     if (!text || sending) return;
     if (!sessionId) {
-      setError("请先在终端中连接一个会话，Agent 需要绑定会话才能执行命令。");
+      setError(t("agent.errorNoSession2"));
       return;
     }
 
@@ -65,8 +68,8 @@ export function AgentPanel() {
     <div className="flex h-full flex-col">
       <header className="flex items-center justify-between border-b border-border px-4 py-3">
         <div className="flex items-center gap-2">
-          <span className="text-sm font-semibold">运维 Agent</span>
-          {streaming ? <Badge variant="outline">思考中…</Badge> : null}
+          <span className="text-sm font-semibold">{t("agent.title")}</span>
+          {streaming ? <Badge variant="outline">{t("agent.thinkingShort")}</Badge> : null}
         </div>
         <Button
           variant="ghost"
@@ -80,35 +83,39 @@ export function AgentPanel() {
             }
           }}
         >
-          清空
+          {t("agent.clear")}
         </Button>
       </header>
 
       <div ref={listRef} className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
         {messages.length === 0 ? (
           <div className="mt-8 text-center text-xs text-muted-foreground">
-            <p className="mb-2">可以让 Agent 做什么？</p>
-            <p className="mb-1">· 「看下磁盘使用情况」</p>
-            <p className="mb-1">· 「这台机器的内存还剩多少」</p>
-            <p>· 「分析下最近的应用错误日志」</p>
+            <p className="mb-2">{t("agent.emptyHint")}</p>
+            <p className="mb-1">{t("agent.suggestion1")}</p>
+            <p className="mb-1">{t("agent.suggestion2")}</p>
+            <p>{t("agent.suggestion3")}</p>
           </div>
         ) : null}
 
         {messages.map((m) => (
           <div key={m.id}>
             <div className="mb-1 text-[11px] font-medium text-muted-foreground">
-              {m.role === "user" ? "你" : "Agent"}
+              {m.role === "user" ? t("agent.roleYou") : "Agent"}
             </div>
             <div
               className={
                 m.role === "user"
                   ? "rounded-lg bg-primary/10 px-3 py-2 text-sm whitespace-pre-wrap"
-                  : "rounded-lg border border-border px-3 py-2 text-sm whitespace-pre-wrap"
+                  : "rounded-lg border border-border px-3 py-2 text-sm"
               }
             >
-              {m.content}
+              {m.role === "user" ? (
+                m.content
+              ) : m.content ? (
+                <MarkdownMessage text={m.content} />
+              ) : null}
               {m.pending && !m.content ? (
-                <span className="text-muted-foreground">正在生成…</span>
+                <span className="text-muted-foreground">{t("agent.generating")}</span>
               ) : null}
             </div>
             {m.toolCalls.map((t) => (
@@ -135,11 +142,11 @@ export function AgentPanel() {
       <footer className="border-t border-border p-3">
         {sessionId ? (
           <div className="mb-2 text-[11px] text-muted-foreground">
-            绑定会话：{activeTab?.title ?? sessionId}
+            {t("agent.boundSession", { name: activeTab?.title ?? sessionId })}
           </div>
         ) : (
           <div className="mb-2 text-[11px] text-amber-500">
-            未绑定会话 —— 先在终端连接一台主机
+            {t("agent.noSession")}
           </div>
         )}
         <Textarea
@@ -151,13 +158,13 @@ export function AgentPanel() {
               void submit();
             }
           }}
-          placeholder="描述你想做的运维操作…（Enter 发送，Shift+Enter 换行）"
+          placeholder={t("agent.inputPlaceholder")}
           rows={3}
           className="resize-none"
         />
         <div className="mt-2 flex justify-end">
           <Button size="sm" onClick={() => void submit()} disabled={sending || !input.trim()}>
-            发送
+            {t("agent.send")}
           </Button>
         </div>
       </footer>

@@ -18,16 +18,17 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { api, SshdeckError } from "@/shared/api";
 import type { AppConfigPatch } from "@/shared/ipc";
+import { useTranslation } from "react-i18next";
+
 import { resolveTheme, useSettingsStore } from "@/stores/settings";
 
-import { ChannelPanel } from "./ChannelPanel";
+import { ModelPanel } from "./ModelPanel";
 import { TokenPanel } from "./TokenPanel";
 
 /** 预设字体栈（都含 Nerd Font 变体，保证远端提示符图标能显示）。 */
-const FONT_PRESETS: { label: string; value: string }[] = [
-  { label: "内置字体栈（推荐）", value: "" },
+const FONT_PRESETS: { label?: string; labelKey?: string; value: string }[] = [
+  { labelKey: "settings.terminal.fontBuiltin", value: "" },
   {
     label: "Cascadia Code",
     value: '"Cascadia Code", "Cascadia Mono", "Consolas", monospace',
@@ -41,20 +42,20 @@ const FONT_PRESETS: { label: string; value: string }[] = [
     value: '"FiraCode Nerd Font", "Fira Code", "Consolas", monospace',
   },
   {
-    label: "MesloLGS NF（Powerlevel10k 推荐）",
+    labelKey: "settings.terminal.fontMeslo",
     value: '"MesloLGS NF", "Consolas", monospace',
   },
   {
-    label: "Consolas（Windows 自带）",
+    labelKey: "settings.terminal.fontConsolas",
     value: '"Consolas", monospace',
   },
 ];
 
-const CURSOR_STYLES = [
-  { label: "方块", value: "block" },
-  { label: "竖线", value: "bar" },
-  { label: "下划线", value: "underline" },
-] as const;
+const CURSOR_STYLES: { label?: string; labelKey?: string; value: string }[] = [
+  { labelKey: "settings.terminal.cursorBlock", value: "block" },
+  { labelKey: "settings.terminal.cursorBar", value: "bar" },
+  { labelKey: "settings.terminal.cursorUnderline", value: "underline" },
+];
 
 interface SettingsPanelProps {
   open: boolean;
@@ -64,6 +65,7 @@ interface SettingsPanelProps {
 export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
   const config = useSettingsStore((s) => s.config);
   const patch = useSettingsStore((s) => s.patch);
+  const { t } = useTranslation();
   const saving = useSettingsStore((s) => s.saving);
   const error = useSettingsStore((s) => s.error);
   const clearError = useSettingsStore((s) => s.clearError);
@@ -71,25 +73,20 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
   // 字号滑块的本地即时值：拖动时先本地响应，松开/停止后再写后端。
   const [fontSizeDraft, setFontSizeDraft] = useState<number | null>(null);
 
-  // Agent 配置：Key 永不回显，只能在输入框里临时填写。
-  const [keyDraft, setKeyDraft] = useState("");
-  const [models, setModels] = useState<string[]>([]);
-  const [probing, setProbing] = useState(false);
-  const [probeError, setProbeError] = useState<string | null>(null);
+  // 说明：模型接入（原「渠道」+「Agent」）已抽到 `ModelPanel`，
+  // 因此本文件不再持有 Key / 模型列表 / 探测状态。
 
   if (!open) return null;
 
   const ui = config?.ui;
   const term = config?.terminal;
   const behavior = config?.behavior;
-  const llm = config?.llm;
 
   const patchTerminal = (p: AppConfigPatch["terminal"]) =>
     void patch({ terminal: p });
   const patchUi = (p: AppConfigPatch["ui"]) => void patch({ ui: p });
   const patchBehavior = (p: AppConfigPatch["behavior"]) =>
     void patch({ behavior: p });
-  const patchLlm = (p: AppConfigPatch["llm"]) => void patch({ llm: p });
 
   const fontSize = fontSizeDraft ?? term?.fontSize ?? 14;
   const fontFamily = term?.fontFamily ?? "";
@@ -99,7 +96,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
       {/* 遮罩：点击关闭 */}
       <button
         type="button"
-        aria-label="关闭设置"
+        aria-label={t("settings.title")}
         className="absolute inset-0 bg-black/50"
         onClick={onClose}
       />
@@ -107,17 +104,17 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
       <aside className="relative z-50 flex h-full w-[580px] flex-col border-l border-border bg-background shadow-xl">
         <header className="flex items-center justify-between border-b border-border px-5 py-3.5">
           <div>
-            <h2 className="text-sm font-semibold">设置</h2>
+            <h2 className="text-sm font-semibold">{t("settings.title")}</h2>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
-              修改会立即保存到本地配置
-              {saving ? " · 保存中…" : ""}
+              {t("settings.subtitle")}
+              {saving ? ` · ${t("common.saving")}` : ""}
             </p>
           </div>
           <div className="flex items-center gap-1">
             <Button
               variant="ghost"
               size="sm"
-              title="恢复默认设置"
+              title={t("settings.resetHint")}
               onClick={() =>
                 void patch({
                   terminal: {
@@ -145,7 +142,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
               }
             >
               <RotateCcw className="size-3.5" />
-              重置
+              {t("common.reset")}
             </Button>
             <Button variant="ghost" size="icon" onClick={onClose}>
               <X className="size-4" />
@@ -155,7 +152,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
 
         {error ? (
           <div className="mx-5 mt-3 flex items-start justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-            <span>保存失败 — {error}</span>
+            <span>{t("settings.saveFailed", { error })}</span>
             <button
               type="button"
               className="shrink-0 opacity-70 hover:opacity-100"
@@ -170,44 +167,41 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
           <Tabs defaultValue="appearance">
             <TabsList className="w-full">
               <TabsTrigger value="appearance" className="flex-1">
-                外观
+                {t("settings.tabs.appearance")}
               </TabsTrigger>
               <TabsTrigger value="terminal" className="flex-1">
-                终端
+                {t("settings.tabs.terminal")}
               </TabsTrigger>
               <TabsTrigger value="behavior" className="flex-1">
-                行为
+                {t("settings.tabs.behavior")}
               </TabsTrigger>
-              <TabsTrigger value="agent" className="flex-1">
-                Agent
-              </TabsTrigger>
-              <TabsTrigger value="channels" className="flex-1">
-                渠道
+              <TabsTrigger value="model" className="flex-1">
+                {t("settings.tabs.model")}
               </TabsTrigger>
               <TabsTrigger value="token" className="flex-1">
-                省 Token
+                {t("settings.tabs.token")}
               </TabsTrigger>
             </TabsList>
 
             {/* ───────────── 外观 ───────────── */}
             <TabsContent value="appearance" className="mt-4 space-y-5">
-              <Section title="主题">
+              <Section title={t("settings.appearance.theme")}>
                 <div className="grid grid-cols-3 gap-2">
                   <ThemeCard
                     icon={<Moon className="size-4" />}
-                    label="深色"
+                    label={t("theme.dark")}
                     active={ui?.theme === "dark"}
                     onClick={() => patchUi({ theme: "dark" })}
                   />
                   <ThemeCard
                     icon={<Sun className="size-4" />}
-                    label="浅色"
+                    label={t("theme.light")}
                     active={ui?.theme === "light"}
                     onClick={() => patchUi({ theme: "light" })}
                   />
                   <ThemeCard
                     icon={<Monitor className="size-4" />}
-                    label="跟随系统"
+                    label={t("theme.system")}
                     active={ui?.theme === "system"}
                     onClick={() => patchUi({ theme: "system" })}
                   />
@@ -216,27 +210,32 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
 
               <Separator />
 
-              <Section title="界面语言">
+              <Section title={t("settings.appearance.language")}>
                 <Select
-                  value={ui?.language ?? "zh"}
-                  onValueChange={(v) => patchUi({ language: v as "zh" | "en" })}
+                  value={ui?.language ?? "system"}
+                  onValueChange={(v) =>
+                    patchUi({ language: v as "system" | "zh" | "en" })
+                  }
                 >
                   <SelectTrigger>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
+                    <SelectItem value="system">
+                      {t("settings.appearance.languageSystem")}
+                    </SelectItem>
                     <SelectItem value="zh">简体中文</SelectItem>
                     <SelectItem value="en">English</SelectItem>
                   </SelectContent>
                 </Select>
-                <Hint>语言切换当前仅影响少量文案，完整 i18n 待后续接入。</Hint>
+                <Hint>{t("settings.appearance.languageHint")}</Hint>
               </Section>
 
               <Separator />
 
-              <Section title="面板宽度">
+              <Section title={t("settings.appearance.panelWidth")}>
                 <SliderRow
-                  label="左栏（主机 / 转发）"
+                  label={t("settings.appearance.sidebarWidth")}
                   value={ui?.sidebarWidth ?? 240}
                   min={160}
                   max={480}
@@ -245,7 +244,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   onChange={(v) => patchUi({ sidebarWidth: v })}
                 />
                 <SliderRow
-                  label="右栏（运维 Agent）"
+                  label={t("settings.appearance.agentWidth")}
                   value={ui?.agentPanelWidth ?? 384}
                   min={260}
                   max={720}
@@ -259,8 +258,8 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
 
               <div className="flex items-center justify-between">
                 <div>
-                  <Label>显示运维 Agent 面板</Label>
-                  <Hint>关闭后右栏隐藏，终端区占满剩余宽度</Hint>
+                  <Label>{t("settings.appearance.showAgent")}</Label>
+                  <Hint>{t("settings.appearance.showAgentHint")}</Hint>
                 </div>
                 <Switch
                   checked={ui?.showAgentPanel ?? true}
@@ -271,7 +270,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
 
             {/* ───────────── 终端 ───────────── */}
             <TabsContent value="terminal" className="mt-4 space-y-5">
-              <Section title="字体">
+              <Section title={t("settings.terminal.fontFamily")}>
                 <Select
                   value={FONT_PRESETS.some((p) => p.value === fontFamily) ? fontFamily : "custom"}
                   onValueChange={(v) => {
@@ -279,20 +278,20 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   }}
                 >
                   <SelectTrigger>
-                    <SelectValue placeholder="选择字体" />
+                    <SelectValue placeholder={t("settings.terminal.fontPlaceholder")} />
                   </SelectTrigger>
                   <SelectContent>
                     {FONT_PRESETS.map((p) => (
-                      <SelectItem key={p.label} value={p.value}>
-                        {p.label}
+                      <SelectItem key={p.value || "builtin"} value={p.value}>
+                        {p.label ?? (p.labelKey ? t(p.labelKey) : p.value)}
                       </SelectItem>
                     ))}
-                    <SelectItem value="custom">自定义…</SelectItem>
+                    <SelectItem value="custom">{t("settings.terminal.fontCustom")}</SelectItem>
                   </SelectContent>
                 </Select>
                 <Input
                   className="mt-2 font-mono text-xs"
-                  placeholder='自定义字体栈，如 "Cascadia Code", "Consolas", monospace'
+                  placeholder={t("settings.terminal.fontCustomPlaceholder")}
                   defaultValue={fontFamily}
                   onBlur={(e) => {
                     const v = e.target.value.trim();
@@ -306,15 +305,15 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   }}
                 />
                 <Hint>
-                  留空使用内置字体栈（已含常见 Nerd Font 变体，可显示远端提示符图标）
+                  {t("settings.terminal.fontFamilyHint")}
                 </Hint>
               </Section>
 
               <Separator />
 
-              <Section title="字号">
+              <Section title={t("settings.terminal.fontSize")}>
                 <SliderRow
-                  label="终端字号"
+                  label={t("settings.terminal.fontSize")}
                   value={fontSize}
                   min={8}
                   max={32}
@@ -328,27 +327,27 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                 />
               </Section>
 
-              <Section title="回滚缓冲">
+              <Section title={t("settings.terminal.scrollback")}>
                 <SliderRow
-                  label="保留行数"
+                  label={t("settings.terminal.scrollbackLines")}
                   value={term?.scrollback ?? 5000}
                   min={500}
                   max={100000}
                   step={500}
-                  unit="行"
+                  unit={t("settings.terminal.linesUnit")}
                   onChange={() => undefined}
                   onCommit={(v) => {
                     if (v !== term?.scrollback) patchTerminal({ scrollback: v });
                   }}
                 />
-                <Hint>行数越大内存占用越高；重启会话后生效。</Hint>
+                <Hint>{t("settings.terminal.scrollbackHint")}</Hint>
               </Section>
 
               <Separator />
 
-              <Section title="光标">
+              <Section title={t("settings.terminal.cursor")}>
                 <div className="flex items-center justify-between">
-                  <Label>样式</Label>
+                  <Label>{t("settings.terminal.cursorStyle")}</Label>
                   <Select
                     value={term?.cursorStyle ?? "block"}
                     onValueChange={(v) =>
@@ -363,14 +362,14 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                     <SelectContent>
                       {CURSOR_STYLES.map((c) => (
                         <SelectItem key={c.value} value={c.value}>
-                          {c.label}
+                          {c.label ?? (c.labelKey ? t(c.labelKey) : c.value)}
                         </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
                 </div>
                 <div className="mt-3 flex items-center justify-between">
-                  <Label>闪烁</Label>
+                  <Label>{t("settings.terminal.cursorBlink")}</Label>
                   <Switch
                     checked={term?.cursorBlink ?? true}
                     onCheckedChange={(v) => patchTerminal({ cursorBlink: v })}
@@ -380,7 +379,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
 
               <Separator />
 
-              <Section title="预览">
+              <Section title={t("settings.terminal.preview")}>
                 <TerminalPreview
                   fontFamily={fontFamily}
                   fontSize={fontSize}
@@ -392,8 +391,8 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
             <TabsContent value="behavior" className="mt-4 space-y-5">
               <div className="flex items-center justify-between">
                 <div>
-                  <Label>关闭标签时确认</Label>
-                  <Hint>避免误关正在运行的会话</Hint>
+                  <Label>{t("settings.behavior.confirmCloseTab")}</Label>
+                  <Hint>{t("settings.behavior.confirmCloseTabHint")}</Hint>
                 </div>
                 <Switch
                   checked={behavior?.confirmOnCloseTab ?? true}
@@ -405,8 +404,8 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
 
               <div className="flex items-center justify-between">
                 <div>
-                  <Label>连接断开时提示音</Label>
-                  <Hint>会话异常断开时播放系统提示音</Hint>
+                  <Label>{t("settings.behavior.bellOnDisconnect")}</Label>
+                  <Hint>{t("settings.behavior.bellOnDisconnectHint")}</Hint>
                 </div>
                 <Switch
                   checked={behavior?.bellOnDisconnect ?? true}
@@ -416,14 +415,14 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
 
               <Separator />
 
-              <Section title="连接失败时自动重试">
+              <Section title={t("settings.behavior.autoReconnect")}>
                 <SliderRow
-                  label="重试次数"
+                  label={t("settings.behavior.retryCount")}
                   value={behavior?.autoReconnectAttempts ?? 0}
                   min={0}
                   max={10}
                   step={1}
-                  unit="次"
+                  unit={t("settings.behavior.timesUnit")}
                   onChange={() => undefined}
                   onCommit={(v) => {
                     if (v !== behavior?.autoReconnectAttempts) {
@@ -431,15 +430,15 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                     }
                   }}
                 />
-                <Hint>0 表示不自动重试</Hint>
+                <Hint>{t("settings.behavior.autoReconnectHint")}</Hint>
               </Section>
 
               <Separator />
 
-              <Section title="新建连接的默认值">
+              <Section title={t("settings.behavior.defaultsForNew")}>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <Label className="text-xs">默认端口</Label>
+                    <Label className="text-xs">{t("settings.behavior.defaultPort")}</Label>
                     <Input
                       type="number"
                       className="mt-1"
@@ -453,10 +452,10 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                     />
                   </div>
                   <div>
-                    <Label className="text-xs">默认用户名</Label>
+                    <Label className="text-xs">{t("settings.behavior.defaultUsername")}</Label>
                     <Input
                       className="mt-1"
-                      placeholder="留空则不填充"
+                      placeholder={t("settings.behavior.defaultEmptyHint")}
                       defaultValue={behavior?.defaultUsername ?? ""}
                       onBlur={(e) => {
                         const v = e.target.value.trim();
@@ -471,141 +470,9 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
             </TabsContent>
 
             {/* ───────────── Agent（大模型接入） ───────────── */}
-            <TabsContent value="agent" className="mt-4 space-y-5">
-              <Section title="服务地址">
-                <Input
-                  placeholder="https://api.deepseek.com/v1"
-                  defaultValue={llm?.baseUrl ?? ""}
-                  onBlur={(e) => {
-                    const v = e.target.value.trim();
-                    if (v && v !== llm?.baseUrl) patchLlm({ baseUrl: v });
-                  }}
-                />
-                <Hint>
-                  兼容 OpenAI 协议的任意服务：DeepSeek、OpenAI、Qwen、vLLM、
-                  Ollama（本地默认 http://127.0.0.1:11434/v1）。缺 /v1 会自动补全。
-                </Hint>
-              </Section>
-
-              <Section title="模型">
-                <Input
-                  placeholder="如 deepseek-chat / qwen2.5:7b"
-                  defaultValue={llm?.model ?? ""}
-                  onBlur={(e) => {
-                    const v = e.target.value.trim();
-                    if (v !== llm?.model) patchLlm({ model: v });
-                  }}
-                />
-                <div className="mt-2 flex items-center gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={probing}
-                    onClick={async () => {
-                      setProbing(true);
-                      try {
-                        const list = await api.agentListModels();
-                        setModels(list.map((m) => m.id));
-                        setProbeError(null);
-                      } catch (err) {
-                        setProbeError(
-                          err instanceof SshdeckError ? `${err.code}: ${err.message}` : String(err),
-                        );
-                      } finally {
-                        setProbing(false);
-                      }
-                    }}
-                  >
-                    {probing ? "探测中…" : "探测可用模型"}
-                  </Button>
-                  {models.length > 0 ? (
-                    <Select
-                      onValueChange={(v) => {
-                        patchLlm({ model: v });
-                      }}
-                    >
-                      <SelectTrigger className="w-56">
-                        <SelectValue placeholder={`发现 ${models.length} 个模型`} />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {models.map((m) => (
-                          <SelectItem key={m} value={m}>
-                            {m}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  ) : null}
-                </div>
-                {probeError ? (
-                  <p className="mt-1 text-[11px] text-destructive">{probeError}</p>
-                ) : null}
-              </Section>
-
-              <Separator />
-
-              <Section title="API Key">
-                {llm?.hasApiKey ? (
-                  <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
-                    <span className="text-xs text-muted-foreground">已配置（保存于本地，不回显）</span>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => patchLlm({ clearApiKey: true })}
-                    >
-                      清除
-                    </Button>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    <Input
-                      type="password"
-                      placeholder="粘贴 API Key 后点保存"
-                      value={keyDraft}
-                      onChange={(e) => setKeyDraft(e.target.value)}
-                    />
-                    <Button
-                      size="sm"
-                      disabled={!keyDraft.trim()}
-                      onClick={() => {
-                        patchLlm({ apiKey: keyDraft.trim() });
-                        setKeyDraft("");
-                      }}
-                    >
-                      保存 Key
-                    </Button>
-                  </div>
-                )}
-                <Hint>
-                  Key 只存在本机（`secrets.json`，Unix 下 0600），前端永不回读明文。
-                </Hint>
-              </Section>
-
-              <Separator />
-
-              <Section title="温度">
-                <SliderRow
-                  label="temperature"
-                  value={Math.round((llm?.temperature ?? 0.2) * 100)}
-                  min={0}
-                  max={200}
-                  step={5}
-                  unit=""
-                  onChange={(v) => patchLlm({ temperature: v / 100 })}
-                />
-                <Hint>0 = 更确定，1 以上 = 更发散。运维场景建议 0.1 – 0.3。</Hint>
-              </Section>
-
-              {llm && !llm.hasApiKey ? (
-                <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
-                  尚未配置 API Key，Agent 面板无法发起对话。
-                </div>
-              ) : null}
-            </TabsContent>
-
-            {/* ───────────── 聚合渠道 ───────────── */}
-            <TabsContent value="channels" className="mt-4">
-              <ChannelPanel />
+            {/* 模型接入：原「渠道」与「Agent」已合并为此单一入口 */}
+            <TabsContent value="model" className="mt-4">
+              <ModelPanel />
             </TabsContent>
 
             {/* ───────────── 省 Token 与审计 ───────────── */}
@@ -617,10 +484,10 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
 
         <footer className="flex items-center justify-between border-t border-border px-5 py-3">
           <span className="text-[11px] text-muted-foreground">
-            配置保存在用户目录下的 state.json
+            {t("settings.configPath")}
           </span>
           <Button size="sm" onClick={onClose}>
-            完成
+            {t("common.done")}
           </Button>
         </footer>
       </aside>
@@ -734,6 +601,7 @@ function TerminalPreview({
   fontFamily: string;
   fontSize: number;
 }) {
+  const { t } = useTranslation();
   const themePref = useSettingsStore((s) => s.config?.ui.theme) ?? "dark";
   const resolved = resolveTheme(themePref);
   const previewBg = resolved === "light" ? "#fafafa" : "#1e1e1e";
@@ -747,7 +615,7 @@ function TerminalPreview({
     <div className="rounded-md border border-border p-3" style={{ background: previewBg }}>
       <div className="mb-1 flex items-center gap-1.5 text-[10px] text-muted-foreground">
         <Type className="size-3" />
-        预览（缩放随字号变化）
+        {t("settings.terminal.previewHint")}
       </div>
       <div
         className="leading-snug whitespace-pre"

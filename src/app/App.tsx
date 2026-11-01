@@ -2,16 +2,28 @@ import { useEffect, useState } from "react";
 import { Settings as SettingsIcon } from "lucide-react";
 
 import { ConnectionsSidebar } from "@/features/connections/ConnectionsSidebar";
+import { FileBrowserPanel } from "@/features/files/FileBrowserPanel";
 import { ForwardPanel } from "@/features/forward/ForwardPanel";
 import { TerminalWorkspace } from "@/features/terminal/TerminalWorkspace";
 import { AgentPanel } from "@/features/agent/AgentPanel";
 import { SettingsPanel } from "@/features/settings/SettingsPanel";
+import { TitleBar } from "@/components/TitleBar";
 import { Button } from "@/components/ui/button";
 import { api } from "@/shared/api";
 import { useConnectionStore } from "@/stores/connection";
+import { useSessionsStore } from "@/stores/sessions";
+import { useTranslation } from "react-i18next";
+
+import { resolveLang, setLanguage, setupI18n } from "@/i18n";
 import { applyThemeClass, resolveTheme, useSettingsStore } from "@/stores/settings";
 
 export function App() {
+  const { t } = useTranslation();
+  // 当前激活的会话 id（文件面板绑定在它上面）
+  const activeTabId = useSessionsStore((s) => s.activeTabId);
+  const tabs = useSessionsStore((s) => s.tabs);
+  const activeSessionId =
+    tabs.find((tab) => tab.id === activeTabId)?.panes.find(Boolean) ?? null;
   const setHosts = useConnectionStore((s) => s.setHosts);
   const setConfig = useConnectionStore((s) => s.setConfig);
 
@@ -55,12 +67,29 @@ export function App() {
     return undefined;
   }, [themePref]);
 
+  // 语言：`ui.language` 三态（system / zh / en）。
+  // `system` 时按系统语言解析，因此首次启动就与系统一致。
+  const langPref = settings?.ui.language ?? "system";
+  useEffect(() => {
+    const lang = resolveLang(langPref);
+    setupI18n(lang);
+    void setLanguage(lang);
+  }, [langPref]);
+
   const sidebarWidth = settings?.ui.sidebarWidth ?? 240;
   const agentWidth = settings?.ui.agentPanelWidth ?? 384;
   const showAgent = settings?.ui.showAgentPanel ?? true;
 
   return (
-    <div className="flex h-full w-full overflow-hidden bg-background text-foreground">
+    <div
+      id="app-shell"
+      className="flex h-full w-full flex-col overflow-hidden bg-background text-foreground"
+    >
+      {/* 自定义标题栏：颜色取自主题变量，随主题切换自动更新 */}
+      <TitleBar />
+
+      {/* 内容区 */}
+      <div className="flex min-h-0 flex-1 overflow-hidden">
       {/* 左栏：主机 / 转发 / 设置入口 */}
       <aside
         className="flex shrink-0 flex-col border-r border-border"
@@ -70,6 +99,15 @@ export function App() {
         <div className="border-t border-border">
           <ForwardPanel />
         </div>
+        {/* 远程文件：只有绑定了会话时才出现（没有会话时 SFTP 无从谈起） */}
+        {activeSessionId ? (
+          <div className="flex min-h-0 flex-1 flex-col border-t border-border">
+            <div className="shrink-0 px-2 py-1.5 text-[11px] font-medium text-muted-foreground">
+              {t("files.title")}
+            </div>
+            <FileBrowserPanel sessionId={activeSessionId} />
+          </div>
+        ) : null}
         <div className="mt-auto border-t border-border p-2">
           <Button
             variant="ghost"
@@ -78,7 +116,7 @@ export function App() {
             onClick={() => setSettingsOpen(true)}
           >
             <SettingsIcon className="size-4" />
-            设置
+            {t("sidebar.settings")}
           </Button>
         </div>
       </aside>
@@ -97,6 +135,8 @@ export function App() {
           <AgentPanel />
         </aside>
       ) : null}
+
+      </div>
 
       <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>

@@ -125,14 +125,13 @@ bash scripts/check.sh test                       # 全部测试
 
 ### 模型接入：免费通道与聚合渠道
 
-设置 → **渠道** 页管理 41 家提供商，按分类分组：
+设置 → **渠道** 页管理 39 家提供商，按分类分组：
 
 | 分类 | 家数 | 说明 |
 |---|---|---|
 | 本机模型 | 3 | Ollama / LM Studio / llama.cpp，**无需 Key、零成本** |
 | 免费额度 | 15 | OpenRouter、Groq、Cerebras 等，需 Key 但有免费额度 |
 | 需 API Key | 21 | DeepSeek、OpenAI、Kimi、MiniMax 等 |
-| OAuth | 2 | 需交互式登录，本应用不代为完成，仅列出 |
 
 模型以 `provider/model` 形式选用，例如 `ollama/qwen2.5:0.5b`。
 

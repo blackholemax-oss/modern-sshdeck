@@ -27,6 +27,8 @@ import { useConnectIntent } from "@/features/connections/connectIntent";
 import { LAYOUT_GRID, LAYOUT_LABEL, LAYOUTS, PANE_COUNT } from "./layout";
 import { TerminalPane } from "./TerminalPane";
 
+import { useTranslation } from "react-i18next";
+
 const LAYOUT_ICON: Record<PaneLayout, typeof Square> = {
   single: Square,
   "split-h": Columns2,
@@ -51,6 +53,7 @@ const STATE_LABEL: Record<SessionState, string> = {
 };
 
 export function TerminalWorkspace() {
+  const { t } = useTranslation();
   const tabs = useSessionsStore((s) => s.tabs);
   const activeTabId = useSessionsStore((s) => s.activeTabId);
   const sessions = useSessionsStore((s) => s.sessions);
@@ -146,7 +149,7 @@ export function TerminalWorkspace() {
       <div className="flex shrink-0 items-stretch gap-1 overflow-x-auto border-b border-border px-1 pt-1">
         {tabs.length === 0 ? (
           <span className="flex h-8 items-center px-2 text-xs text-muted-foreground">
-            暂无会话 —— 在左侧选择主机建立连接
+            {t("terminal.noSession")}
           </span>
         ) : null}
 
@@ -175,7 +178,7 @@ export function TerminalWorkspace() {
               <span className="truncate">{tab.title}</span>
               <button
                 type="button"
-                aria-label={`关闭 ${tab.title}`}
+                aria-label={t("terminal.closeTab", { title: tab.title })}
                 className="ml-0.5 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/20 hover:text-destructive group-hover:opacity-100"
                 onClick={(e) => {
                   e.stopPropagation();
@@ -201,7 +204,7 @@ export function TerminalWorkspace() {
                 size="sm"
                 className="h-7 px-2"
                 disabled={!activeTab}
-                title={`${LAYOUT_LABEL[layout]}（${PANE_COUNT[layout]} 屏，空位可点击连接）`}
+                title={`${LAYOUT_LABEL[layout]}（${PANE_COUNT[layout]} 屏，空位可{t("terminal.clickToConnect")}）`}
                 onClick={() => handleLayout(layout)}
               >
                 <Icon className="size-3.5" />
@@ -227,9 +230,9 @@ export function TerminalWorkspace() {
         {!activeTab ? (
           <div className="flex h-full flex-col items-center justify-center gap-1 text-neutral-500">
             <Circle className="size-5 opacity-40" />
-            <span className="text-sm">点击连接</span>
+            <span className="text-sm">{t("terminal.clickToConnect")}</span>
             <span className="text-xs opacity-60">
-              <Plus className="mb-0.5 inline size-3" /> 在左侧主机列表选择一台服务器
+              <Plus className="mb-0.5 inline size-3" /> {t("terminal.selectHostFirst")}
             </span>
           </div>
         ) : (

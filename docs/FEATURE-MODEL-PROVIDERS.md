@@ -108,14 +108,14 @@ Kilo 网关存在**两套互不相同的 model id 命名空间**，同一个模�
 pub struct ProviderEntry {
     pub id: &'static str,           // 稳定标识，如 "openrouter"
     pub name: &'static str,         // 展示名
-    pub category: ProviderCategory, // Free | FreeTier | ApiKey | OAuth | Local
+    pub category: ProviderCategory, // Free | FreeTier | ApiKey | Local
     pub base_url: Option<&'static str>, // None = 必须由用户覆盖（Azure/Cloudflare/Vertex）
     pub auth: AuthKind,             // None | Bearer | Header(&str) ...
     pub docs_url: Option<&'static str>,
     pub note: Option<&'static str>, // 展示给用户的一句话说明
 }
 
-pub enum ProviderCategory { Free, FreeTier, ApiKey, OAuth, Local }
+pub enum ProviderCategory { Free, FreeTier, ApiKey, Local }
 pub enum AuthKind { None, Bearer }
 ```
 
@@ -123,7 +123,10 @@ pub enum AuthKind { None, Bearer }
 - `Free`：无需任何 Key（Kilo 公有池、本机免账号）
 - `FreeTier`：需 Key 但有免费额度
 - `ApiKey`：需付费 Key
-- `OAuth`：需交互式登录 → **只列出，标注「不可驱动」**
+- ~~`OAuth`：需交互式登录 → 只列出、标注「不可驱动」~~
+  **已移除**：Gemini / Google ADC 两个需交互式 OAuth 的条目在 2026-11 删除。
+  本应用无法驱动它们，列在界面上只会误导用户 —— 想用 Gemini 请填 API Key
+  走 OpenAI 兼容端点。
 - `Local`：本机服务（Ollama / LM Studio / llama.cpp）
 
 ### 3.2 统一模型标识

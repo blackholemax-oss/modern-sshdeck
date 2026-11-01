@@ -6,6 +6,7 @@
 pub mod dto;
 pub mod events;
 pub mod extras;
+pub mod fs;
 
 use tauri::State;
 
@@ -154,8 +155,49 @@ pub async fn agent_approve(
 #[tauri::command]
 pub async fn agent_list_models(state: State<'_, AppState>) -> AppResult<Vec<AgentModelInfo>> {
     let cfg = state.config.lock().await.clone();
-    let key = state.persist.llm_api_key();
-    state.agent.list_models(&cfg.llm.base_url, &key).await
+
+    // ⚠️ 必须用**用户真正选中的通道**（`active_model`）来列举模型，
+    // 不能用遗留的 `llm.base_url` 字段。
+    //
+    // 真实缺陷：配置里 `activeModel = "ollama/qwen3:8b"`，而 `baseUrl` 仍是
+    // 出厂默认的 `https://api.deepseek.com/v1` 且没有 Key。旧实现读 `baseUrl`，
+    // 于是拿「用 Ollama」的意图去打 DeepSeek 的接口，上游回
+    // `401 Authentication Fails (governor)` —— 用户看到「governor」无从判断
+    // 真实原因其实是「请求打错了主机」。
+    let channels: std::collections::HashMap<String, crate::llm::router::ChannelConfig> = cfg
+        .llm
+        .channels
+        .iter()
+        .map(|c| (c.provider_id.clone(), c.clone().into()))
+        .collect();
+    // 渠道 Key 只存持久层（public_config 只暴露 has_key）
+    let store = crate::persist::store::PersistStore::new();
+    let mut channels_with_key = channels;
+    for (pid, k) in store.channel_api_keys() {
+        if let Some(c) = channels_with_key.get_mut(&pid) {
+            c.api_key = Some(k);
+        }
+    }
+    let default_cfg = crate::llm::router::DefaultLlmConfig {
+        base_url: cfg.llm.base_url.clone(),
+        model: cfg.llm.model.clone(),
+        api_key: state.persist.llm_api_key(),
+    };
+    let target = crate::llm::router::resolve(&cfg.llm.active_model, &channels_with_key, &default_cfg)?;
+
+    let key = target.api_key.clone().unwrap_or_default();
+    state
+        .agent
+        .list_models(&target.base_url, &key)
+        .await
+        .map_err(|e| {
+            // 把「哪个通道、哪个主机」带进错误，避免下次又被误读
+            AppError::Llm(format!(
+                "[{}] {}",
+                target.provider.name,
+                e.message()
+            ))
+        })
 }
 
 #[tauri::command]

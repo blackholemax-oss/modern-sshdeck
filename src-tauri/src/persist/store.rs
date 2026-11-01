@@ -82,8 +82,9 @@ fn default_true() -> bool {
 fn default_theme() -> String {
     "dark".into()
 }
+/// 默认跟随系统语言（三态：`system` / `zh` / `en`）。
 fn default_language() -> String {
-    "zh".into()
+    "system".into()
 }
 fn default_sidebar_width() -> u32 {
     240
@@ -388,7 +389,8 @@ impl PersistStore {
                 }
             }
             if let Some(v) = u.language {
-                if matches!(v.as_str(), "zh" | "en") {
+                // 三态：`system` 跟随系统语言（默认），`zh` / `en` 为显式选择。
+                if matches!(v.as_str(), "system" | "zh" | "en") {
                     st.config.ui_language = v;
                 }
             }
@@ -524,7 +526,8 @@ mod tests {
         assert!(cfg.terminal.cursor_blink);
 
         assert_eq!(cfg.ui.theme, "dark");
-        assert_eq!(cfg.ui.language, "zh");
+        // 默认跟随系统语言：存 `"system"`，由前端按 navigator.languages 解析
+        assert_eq!(cfg.ui.language, "system");
         assert_eq!(cfg.ui.sidebar_width, 240);
         assert_eq!(cfg.ui.agent_panel_width, 384);
         assert!(cfg.ui.show_agent_panel);
@@ -574,6 +577,7 @@ mod tests {
                 ui: Some(UiConfigPatch {
                     theme: Some("rainbow".into()),       // 非法主题 → 忽略
                     language: Some("fr".into()),         // 不支持的语言 → 忽略
+                    // 注：`system` 是合法值（跟随系统），见下方断言
                     sidebar_width: Some(10),             // 夹到 160
                     agent_panel_width: Some(9999),       // 夹到 720
                     show_agent_panel: Some(false),
@@ -594,12 +598,27 @@ mod tests {
         assert_eq!(cfg.terminal.cursor_style, "block", "bad cursor style ignored");
 
         assert_eq!(cfg.ui.theme, "dark", "bad theme ignored");
-        assert_eq!(cfg.ui.language, "zh", "unsupported language ignored");
+        // 默认是 `system`（跟随系统），`fr` 这类不支持的值应被忽略、保持原值
+        assert_eq!(cfg.ui.language, "system", "unsupported language ignored");
         assert_eq!(cfg.ui.sidebar_width, 160);
         assert_eq!(cfg.ui.agent_panel_width, 720);
         assert!(!cfg.ui.show_agent_panel);
 
         assert_eq!(cfg.behavior.auto_reconnect_attempts, 10);
+        // `system` 是合法语言值（跟随系统），必须能写入
+        store.apply_patch(AppConfigPatch {
+            ui: Some(UiConfigPatch {
+                language: Some("system".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            store.public_config().ui.language,
+            "system",
+            "system 必须被接受（默认跟随系统语言）"
+        );
+
     }
 
     #[test]

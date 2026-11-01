@@ -16,6 +16,8 @@ import {
   Power,
 } from "lucide-react";
 
+import { useTranslation } from "react-i18next";
+
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -30,12 +32,12 @@ const DEFAULT_LISTEN_HOST = "127.0.0.1";
 
 const STATE_BADGE: Record<
   ForwardState,
-  { label: string; variant: "default" | "secondary" | "destructive" | "outline" | "success" }
+  { labelKey: string; variant: "default" | "secondary" | "destructive" | "outline" | "success" }
 > = {
-  starting: { label: "启动中", variant: "secondary" },
-  running: { label: "运行中", variant: "success" },
-  stopped: { label: "已停止", variant: "outline" },
-  failed: { label: "失败", variant: "destructive" },
+  starting: { labelKey: "forward.status.starting", variant: "secondary" },
+  running: { labelKey: "forward.status.running", variant: "success" },
+  stopped: { labelKey: "forward.status.stopped", variant: "outline" },
+  failed: { labelKey: "forward.status.failed", variant: "destructive" },
 };
 
 function errorText(err: unknown): string {
@@ -59,6 +61,7 @@ interface ForwardForm {
 }
 
 export function ForwardPanel() {
+  const { t } = useTranslation();
   const forwards = useForwardStore((s) => s.forwards);
   const upsertForward = useForwardStore((s) => s.upsertForward);
   const removeForward = useForwardStore((s) => s.removeForward);
@@ -143,10 +146,10 @@ export function ForwardPanel() {
   const handleStart = async () => {
     const listenPort = parsePort(form.listenPort);
     const remotePort = parsePort(form.remotePort);
-    if (!effectiveSessionId) return setError("请先建立一个 SSH 会话");
-    if (listenPort === null) return setError("本地端口必须是 1–65535 的整数");
-    if (remotePort === null) return setError("远端端口必须是 1–65535 的整数");
-    if (!form.remoteHost.trim()) return setError("请填写远端主机");
+    if (!effectiveSessionId) return setError(t("forward.errorNoSession"));
+    if (listenPort === null) return setError(t("forward.errorLocalPortInt"));
+    if (remotePort === null) return setError(t("forward.errorRemotePortInt"));
+    if (!form.remoteHost.trim()) return setError(t("forward.errorRemoteHost"));
 
     setError(null);
     setSubmitting(true);
@@ -188,7 +191,7 @@ export function ForwardPanel() {
       <div className="flex shrink-0 items-center justify-between px-3 py-2">
         <div className="flex items-center gap-1.5 text-xs font-medium tracking-wide text-muted-foreground">
           <Network className="size-3.5" />
-          <span>端口转发</span>
+          <span>{t("sidebar.portForward")}</span>
           <Badge variant="secondary" className="h-4 px-1 text-[10px]">
             {forwards.length}
           </Badge>
@@ -197,7 +200,7 @@ export function ForwardPanel() {
           variant="ghost"
           size="sm"
           className="h-7 px-1.5"
-          title="新建转发"
+          title={t("forward.add")}
           onClick={() => {
             setOpen((v) => !v);
             setError(null);
@@ -216,14 +219,14 @@ export function ForwardPanel() {
       {open ? (
         <div className="mx-2 mb-2 space-y-2 rounded-md border border-border bg-card/40 p-2">
           <div className="space-y-1">
-            <Label className="text-[11px] font-normal text-muted-foreground">会话</Label>
+            <Label className="text-[11px] font-normal text-muted-foreground">{t("forward.session")}</Label>
             <select
               className="h-7 w-full rounded-md border border-input bg-transparent px-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={effectiveSessionId}
               onChange={(e) => patchForm({ sessionId: e.target.value })}
             >
               {sessionList.length === 0 ? (
-                <option value="">（暂无可转发会话）</option>
+                <option value="">{t("forward.noSessionOption")}</option>
               ) : null}
               {sessionList.map((s) => (
                 <option key={s.id} value={s.id}>
@@ -235,7 +238,7 @@ export function ForwardPanel() {
 
           <div className="grid grid-cols-2 gap-2">
             <div className="space-y-1">
-              <Label className="text-[11px] font-normal text-muted-foreground">本地端口</Label>
+              <Label className="text-[11px] font-normal text-muted-foreground">{t("forward.localPort")}</Label>
               <Input
                 className="h-7 text-xs"
                 type="number"
@@ -246,7 +249,7 @@ export function ForwardPanel() {
               />
             </div>
             <div className="space-y-1">
-              <Label className="text-[11px] font-normal text-muted-foreground">本地地址</Label>
+              <Label className="text-[11px] font-normal text-muted-foreground">{t("forward.localAddress")}</Label>
               <Input
                 className="h-7 text-xs"
                 value={form.listenHost}
@@ -254,7 +257,7 @@ export function ForwardPanel() {
               />
             </div>
             <div className="col-span-2 space-y-1">
-              <Label className="text-[11px] font-normal text-muted-foreground">远端主机</Label>
+              <Label className="text-[11px] font-normal text-muted-foreground">{t("forward.remoteHost")}</Label>
               <Input
                 className="h-7 text-xs"
                 value={form.remoteHost}
@@ -263,7 +266,7 @@ export function ForwardPanel() {
               />
             </div>
             <div className="space-y-1">
-              <Label className="text-[11px] font-normal text-muted-foreground">远端端口</Label>
+              <Label className="text-[11px] font-normal text-muted-foreground">{t("forward.remotePort")}</Label>
               <Input
                 className="h-7 text-xs"
                 type="number"
@@ -284,7 +287,7 @@ export function ForwardPanel() {
                 size="sm"
                 className="h-7 shrink-0 text-xs"
                 disabled={submitting || !effectiveSessionId}
-                title={effectiveSessionId ? "启动本地端口转发" : "没有可用会话"}
+                title={effectiveSessionId ? t("forward.startForward") : t("forward.noSessionHint")}
                 onClick={() => void handleStart()}
               >
                 {submitting ? <LoaderCircle className="size-3.5 animate-spin" /> : <Power className="size-3.5" />}
@@ -300,7 +303,7 @@ export function ForwardPanel() {
                   setError(null);
                 }}
               >
-                取消
+                {t("common.cancel")}
               </Button>
             </div>
           </div>
@@ -310,7 +313,7 @@ export function ForwardPanel() {
       <div className="min-h-0 flex-1 space-y-1 overflow-y-auto px-2 pb-2">
         {forwards.length === 0 ? (
           <div className="px-1 py-3 text-center text-[11px] text-muted-foreground">
-            暂无转发规则。
+            {t("forward.empty")}
           </div>
         ) : null}
 
@@ -332,13 +335,13 @@ export function ForwardPanel() {
                   variant={badge.variant}
                   className={cn("h-4 shrink-0 px-1 text-[10px]", f.state === "running" && "animate-none")}
                 >
-                  {badge.label}
+                  {t(badge.labelKey)}
                 </Badge>
                 <Button
                   size="sm"
                   variant="ghost"
                   className="size-5 shrink-0 p-0 text-muted-foreground hover:text-destructive"
-                  title="停止转发"
+                  title={t("forward.stop")}
                   disabled={stopping}
                   onClick={() => void handleStop(f.id)}
                 >

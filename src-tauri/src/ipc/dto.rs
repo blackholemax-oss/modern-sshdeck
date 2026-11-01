@@ -142,6 +142,12 @@ impl Default for TerminalConfig {
 #[serde(rename_all = "camelCase")]
 pub struct UiConfig {
     pub theme: String,
+    /// `"system"`（默认，跟随系统）/ `"zh"` / `"en"`。
+    ///
+    /// 用三态而不是两态：`"system"` 让「默认跟随系统语言」与
+    /// 「用户显式选择了中文」可区分 —— 否则后端默认写 `"zh"`，
+    /// 前端无法知道你到底是没设置过、还是就想要中文。
+    #[serde(default = "default_language")]
     pub language: String,
     pub sidebar_width: u32,
     pub agent_panel_width: u32,
@@ -152,12 +158,16 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: "dark".into(),
-            language: "zh".into(),
+            language: default_language(),
             sidebar_width: 240,
             agent_panel_width: 384,
             show_agent_panel: true,
         }
     }
+}
+
+fn default_language() -> String {
+    "system".to_string()
 }
 
 /// 行为类开关。
@@ -391,7 +401,7 @@ pub struct AgentModelInfo {
 pub struct ProviderDto {
     pub id: String,
     pub name: String,
-    /// local / free / free_tier / api_key / oauth
+    /// local / free / free_tier / api_key
     pub category: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,

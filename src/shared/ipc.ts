@@ -69,7 +69,7 @@ export interface ComboConfig {
 export interface ProviderDto {
   id: string;
   name: string;
-  /** local | free | free_tier | api_key | oauth */
+  /** local | free | free_tier | api_key */
   category: string;
   baseUrl?: string;
   docsUrl?: string;
@@ -127,7 +127,8 @@ export interface TerminalConfig {
 export interface UiConfig {
   theme: "dark" | "light" | "system";
   /** 界面语言（当前仅中英） */
-  language: "zh" | "en";
+  /** "system"（跟随系统）| "zh" | "en" */
+  language: "system" | "zh" | "en";
   /** 左栏宽度像素 */
   sidebarWidth: number;
   /** 右栏（Agent）宽度像素 */
@@ -352,6 +353,34 @@ export const Events = {
   agentError: "agent:error",
 } as const;
 
+/** 远程目录项。 */
+export interface RemoteEntry {
+  name: string;
+  path: string;
+  /** file | dir | symlink | other */
+  kind: string;
+  size: number;
+  modified: number;
+  mode: number;
+}
+
+/** 目录列表。 */
+export interface DirListing {
+  path: string;
+  parent?: string;
+  entries: RemoteEntry[];
+}
+
+/** 文件预览。 */
+export interface FilePreview {
+  path: string;
+  size: number;
+  isText: boolean;
+  content?: string;
+  truncated: boolean;
+  reason?: string;
+}
+
 // ───────────────────────────── 命令名常量 ─────────────────────────────
 
 export const Commands = {
@@ -380,4 +409,8 @@ export const Commands = {
   tokenStatsReset: "token_stats_reset",
   auditTail: "audit_tail",
   auditCount: "audit_count",
+  fsListDir: "fs_list_dir",
+  fsReadFile: "fs_read_file",
+  fsDownload: "fs_download",
+  fsUpload: "fs_upload",
 } as const;
