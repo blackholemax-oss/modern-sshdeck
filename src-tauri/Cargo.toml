@@ -30,6 +30,7 @@ futures-util = "0.3"
 russh = { version = "0.54", default-features = false, features = ["ring", "rsa"] }
 dirs = "6"
 rand = "0.9"
+russh-sftp = "3.0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -77,6 +77,15 @@ use crate::llm::registry::KILO_GATEWAY_BASE;
 /// 探测与模型发现的 HTTP 超时（契约要求 10s）。
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Kilo 网关清单的读超时。
+///
+ /// ⚠️ 实测（2026-11）：`api.kilo.ai/api/gateway/models` 的响应体约 **400–520 KB**，
+ /// 端到端耗时 **26–30 秒**（重复测三次：30.0s / 26.8s / 26.6s）。
+ /// 用统一的 10 秒 `PROBE_TIMEOUT` 会在读 body 时超时，reqwest 返回**空 body**，
+ /// 于是 serde 报 `EOF while parsing a value at line 1 column 0`
+ /// —— 这正是用户看到的「网关模型清单读取失败」的来源。
+pub const CATALOG_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Kilo 自动免费路由的模型 id（实测免登录可用，cost=0）。
 ///
 /// 实测矩阵（`POST https://kilo.ai/api/gateway/v1/chat/completions`，2026-11）：
@@ -112,6 +121,15 @@ fn build_client() -> Client {
         .unwrap_or_else(|_| Client::new())
 }
 
+/// 用于拉取**大模型清单**的 client（Kilo 两份目录都 400KB+、耗时 30s）。
+fn build_catalog_client() -> Client {
+    Client::builder()
+        .connect_timeout(PROBE_TIMEOUT)
+        .timeout(CATALOG_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
 /// 探测结论。**每个变体都对应一次真实的探测结果**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeStatus {
@@ -125,7 +143,8 @@ pub enum ProbeStatus {
     Unauthorized,
     /// 只能读公开目录，不能用作推理入口（Kilo）。
     CatalogOnly,
-    /// OAuth 类，本应用不驱动。
+    /// 该渠道不支持探测（保留给未来需要交互式登录的通道；
+    /// 当前 OAuth 条目已移除，一般不会出现在结果里）。
     Unsupported,
 }
 
@@ -385,7 +404,7 @@ pub fn parse_kilo_catalog(v: &Value) -> Vec<KiloCatalogModel> {
 
 /// 拉取 Kilo 公开目录（不调推理端点）。
 pub async fn fetch_kilo_catalog() -> AppResult<Vec<KiloCatalogModel>> {
-    let client = build_client();
+    let client = build_catalog_client();
     let resp = client.get(KILO_CATALOG_URL).send().await.map_err(|e| {
         if e.is_timeout() {
             AppError::Llm(format!("读取 Kilo 模型目录超时（{}s）", PROBE_TIMEOUT.as_secs()))
@@ -471,7 +490,8 @@ pub fn parse_kilo_gateway_models(v: &Value) -> Vec<KiloFreeModel> {
 
 /// 拉取 Kilo 免 Key 免费池清单（真实网络请求，超时 20s）。
 pub async fn fetch_kilo_free_models() -> AppResult<Vec<KiloFreeModel>> {
-    let client = build_client();
+    // 清单很大且慢（见 CATALOG_TIMEOUT 的实测注释），必须用长超时 client
+    let client = build_catalog_client();
     let resp = client
         .get(crate::llm::registry::KILO_GATEWAY_MODELS_URL)
         .header("user-agent", "modern-sshdeck")
@@ -517,9 +537,15 @@ pub async fn discover_models(
     key: Option<&str>,
     base_url_override: Option<&str>,
 ) -> AppResult<Vec<String>> {
-    if provider.category == ProviderCategory::OAuth {
+    // ⚠️ 前置校验：需要 Key 但没填时，**不要发请求**。
+    //
+    // 之前会把注定失败的请求发出去，上游回 401 后原样抛给用户，
+    // 于是界面上出现一堆看不懂的报错，例如 DeepSeek 的
+    // 「Authentication Fails (governor)」—— 用户看到「governor」完全不知道
+    // 那其实只是「你没填 Key」。这里改为给出可操作的中文说明。
+    if provider.auth == AuthKind::Bearer && key.map(str::trim).unwrap_or("").is_empty() {
         return Err(AppError::Llm(format!(
-            "{} 需要交互式 OAuth 登录，本应用不驱动该通道；请改用 API Key 方式",
+            "{} 需要 API Key：请先在「渠道」页填入 Key，再探测可用模型",
             provider.name
         )));
     }
@@ -610,16 +636,6 @@ pub async fn probe(
     key: Option<&str>,
     base_url_override: Option<&str>,
 ) -> ProbeOutcome {
-    if provider.category == ProviderCategory::OAuth {
-        return ProbeOutcome::new(
-            ProbeStatus::Unsupported,
-            format!(
-                "{} 需要交互式 OAuth 登录，本应用只列出、不驱动",
-                provider.name
-            ),
-        );
-    }
-
     // Kilo：目录可读，推理需账号 —— 单独一条路径，避免被误报成可用
     if provider.id == "kilo" {
         return probe_kilo().await;

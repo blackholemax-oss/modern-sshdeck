@@ -8,4 +8,5 @@
 pub mod auth;
 pub mod config;
 pub mod manager;
+pub mod sftp;
 pub mod session;

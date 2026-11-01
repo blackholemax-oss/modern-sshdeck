@@ -13,6 +13,7 @@
  * 因此所有回调里都通过 `termRef.current` 取**当前**实例，绝不在 effect 顶部捕获。
  */
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { ChevronDown, ChevronUp, Terminal as TerminalIcon, X } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { FitAddon } from "@xterm/addon-fit";
@@ -54,6 +55,7 @@ export function TerminalPane({
   active = false,
   onRequestConnect,
 }: TerminalPaneProps) {
+  const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const searchRef = useRef<SearchAddon | null>(null);
@@ -252,8 +254,8 @@ export function TerminalPane({
         const term = termRef.current;
         if (!term) return;
         const line = payload.reason
-          ? `[连接已断开] ${payload.reason}`
-          : "[连接已断开]";
+          ? t("terminal.disconnectedWith", { reason: payload.reason })
+          : t("terminal.disconnected");
         term.writeln(`\r\n\x1b[33m${line}\x1b[0m`);
       });
       if (disposed) {
@@ -287,8 +289,8 @@ export function TerminalPane({
         }}
       >
         <TerminalIcon className="size-5 opacity-50" />
-        <span className="text-sm">点击连接</span>
-        <span className="text-xs opacity-60">在左侧选择主机</span>
+        <span className="text-sm">{t("terminal.clickToConnect")}</span>
+        <span className="text-xs opacity-60">{t("terminal.selectHost")}</span>
       </button>
     );
   }
@@ -327,12 +329,12 @@ export function TerminalPane({
                 termRef.current?.focus();
               }
             }}
-            placeholder="搜索终端输出"
+            placeholder={t("terminal.searchPlaceholder")}
             className="h-6 w-40 bg-transparent px-1 text-xs text-neutral-100 outline-none placeholder:text-neutral-500"
           />
           <button
             type="button"
-            title="下一个"
+            title={t("terminal.next")}
             className="rounded p-0.5 text-neutral-400 hover:text-neutral-100"
             onClick={() => searchRef.current?.findNext(searchTerm)}
           >
@@ -340,7 +342,7 @@ export function TerminalPane({
           </button>
           <button
             type="button"
-            title="上一个"
+            title={t("terminal.prev")}
             className="rounded p-0.5 text-neutral-400 hover:text-neutral-100"
             onClick={() => searchRef.current?.findPrevious(searchTerm)}
           >
@@ -348,7 +350,7 @@ export function TerminalPane({
           </button>
           <button
             type="button"
-            title="关闭搜索"
+            title={t("terminal.closeSearch")}
             className="rounded p-0.5 text-neutral-400 hover:text-neutral-100"
             onClick={() => {
               setSearchOpen(false);

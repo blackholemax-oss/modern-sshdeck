@@ -393,6 +393,21 @@ impl SessionManager {
         Ok(collect_output(channel, timeout).await)
     }
 
+    /// 打开一个 SFTP 会话（每次操作独立开 channel）。
+    ///
+    /// 为什么不常驻一个 SftpSession：
+    /// - 它绑定在 channel 上，长时间空闲会被服务端断开；
+    /// - 把它放进 `SessionEntry` 要给 Mutex 加一层生命周期管理，
+    ///   而文件操作是低频交互，重开 channel 的代价可以接受。
+    pub async fn open_sftp(
+        &self,
+        session_id: &str,
+    ) -> AppResult<russh_sftp::client::SftpSession> {
+        let entry = self.get(session_id).await?;
+        let handle = entry.handle.lock().await;
+        crate::ssh::sftp::open_sftp(&handle).await
+    }
+
     /// 标记会话状态并广播（内部使用）。
     ///
     /// 注：事件 `session:state` 的 emit 需要 `AppHandle`，由 `create` / 读任务负责；

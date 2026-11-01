@@ -95,3 +95,87 @@
       sans-serif;
   }
 }
+
+/*
+ * ── 自定义窗口装饰（tauri.conf.json: decorations=false）──
+ *
+ * 系统标题栏已关闭，配色由 `TitleBar` 取自主题变量（`--card` / `--border` /
+ * `--foreground`），因此会随主题切换自动更新。
+ *
+ * 圆角这里**不自己画**：`transparent=false` 时 Windows 11 的 DWM 会给带阴影
+ * 的窗口自动圆角，并且resize 边框由 Tauri 的命中测试接管。
+ * 自己画圆角必须开 `transparent=true`，那会让窗口四角露出桌面
+ * （实测：shell 1440px 而窗口 1456px，右侧露出 16px 桌面残影），得不偿失。
+ */
+
+/*
+ * ── Agent 消息的 Markdown 代码高亮 ──
+ *
+ * highlight.js 自带主题是「整套配色」，直接用会在我们的深/浅主题下
+ * 出现对比度问题。这里不复用它的主题文件，而是把 hljs 的类映射到
+ * **本项目的主题变量**，因此深色/浅色都自动适配。
+ *
+ * 只定义常用的几类 token；未覆盖的 token 用 `--foreground` 兜底。
+ */
+.markdown-body .hljs-keyword,
+.markdown-body .hljs-built_in,
+.markdown-body .hljs-literal,
+.markdown-body .hljs-title,
+.markdown-body .hljs-section {
+  color: oklch(0.62 0.16 265);
+}
+
+.markdown-body .hljs-string,
+.markdown-body .hljs-attr,
+.markdown-body .hljs-template-variable {
+  color: oklch(0.6 0.13 150);
+}
+
+.markdown-body .hljs-number,
+.markdown-body .hljs-symbol {
+  color: oklch(0.65 0.15 60);
+}
+
+.markdown-body .hljs-comment,
+.markdown-body .hljs-meta {
+  color: var(--muted-foreground);
+  font-style: italic;
+}
+
+.markdown-body .hljs-variable,
+.markdown-body .hljs-params,
+.markdown-body .hljs-property,
+.markdown-body .hljs-attribute {
+  color: oklch(0.62 0.14 25);
+}
+
+/* 深色主题下提亮一档，保证对比度 */
+.dark .markdown-body .hljs-keyword,
+.dark .markdown-body .hljs-built_in,
+.dark .markdown-body .hljs-literal,
+.dark .markdown-body .hljs-title,
+.dark .markdown-body .hljs-section {
+  color: oklch(0.78 0.13 265);
+}
+
+.dark .markdown-body .hljs-string,
+.dark .markdown-body .hljs-attr {
+  color: oklch(0.78 0.12 150);
+}
+
+.dark .markdown-body .hljs-number,
+.dark .markdown-body .hljs-symbol {
+  color: oklch(0.8 0.12 60);
+}
+
+.dark .markdown-body .hljs-variable,
+.dark .markdown-body .hljs-params,
+.dark .markdown-body .hljs-property,
+.dark .markdown-body .hljs-attribute {
+  color: oklch(0.78 0.11 25);
+}
+
+/* 表格里的行内代码不应撑开行高 */
+.markdown-body table code {
+  font-size: 11px;
+}

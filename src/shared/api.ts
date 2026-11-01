@@ -138,6 +138,16 @@ export const api = {
   auditTail: (limit = 50) =>
     invokeCommand<contract.AuditEntryDto[]>(contract.Commands.auditTail, { limit }),
   auditCount: () => invokeCommand<number>(contract.Commands.auditCount),
+
+  // 远程文件管理（SFTP）
+  fsListDir: (sessionId: string, path: string) =>
+    invokeCommand<contract.DirListing>(contract.Commands.fsListDir, { sessionId, path }),
+  fsReadFile: (sessionId: string, path: string) =>
+    invokeCommand<contract.FilePreview>(contract.Commands.fsReadFile, { sessionId, path }),
+  fsDownload: (sessionId: string, remotePath: string, localPath: string) =>
+    invokeCommand<number>(contract.Commands.fsDownload, { sessionId, remotePath, localPath }),
+  fsUpload: (sessionId: string, localPath: string, remotePath: string) =>
+    invokeCommand<number>(contract.Commands.fsUpload, { sessionId, localPath, remotePath }),
 };
 
 // ───────────────────────────── 事件 ─────────────────────────────

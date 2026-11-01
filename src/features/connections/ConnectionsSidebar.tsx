@@ -3,7 +3,7 @@
  *
  * 交互约定：
  * - 点击主机行 → 在该行下方展开内联的凭据输入（密码 / 私钥口令），不使用模态弹窗。
- * - 「新建连接」表单内联展开，可勾选「保存为主机」（`api.upsertHost`）。
+ * - 「新建连接」表单内联展开，可勾选「{t("host.saveAsHost")}」（`api.upsertHost`）。
  * - 所有错误内联展示（`SshdeckError.code` + `message`），绝不使用 alert/confirm。
  * - 连接成功后：若有空 pane 意图则填入该 pane，否则 `useSessionsStore.addTab`。
  */
@@ -35,6 +35,7 @@ import { PANE_COUNT } from "@/features/terminal/layout";
 import { ensureCapture } from "@/features/terminal/pendingOutput";
 
 import { useConnectIntent } from "./connectIntent";
+import { useTranslation } from "react-i18next";
 
 /** 建立会话时上报的初始尺寸（随后由 ResizeObserver 纠正）。 */
 const DEFAULT_COLS = 80;
@@ -84,6 +85,7 @@ function layoutForPaneCount(count: number): PaneLayout {
 }
 
 export function ConnectionsSidebar() {
+  const { t } = useTranslation();
   const hosts = useConnectionStore((s) => s.hosts);
   const upsertHostLocal = useConnectionStore((s) => s.upsertHost);
   const removeHostLocal = useConnectionStore((s) => s.removeHost);
@@ -163,11 +165,11 @@ export function ConnectionsSidebar() {
       useConnectIntent.getState().clear();
       useConnectIntent.getState().setFormOpen(false);
       setFormOpen(false);
-      setNotice(`已连接到 ${title}`);
+      setNotice(t("host.connectedTo", { title }));
       return;
     }
     addTab(sessionId, title);
-    setNotice(`已连接到 ${title}`);
+    setNotice(t("host.connectedTo", { title }));
   };
 
   const doConnect = async (req: ConnectRequest, title: string) => {
@@ -204,11 +206,11 @@ export function ConnectionsSidebar() {
         : { kind: "password" as const, password: promptPassword };
 
     if (host.authType === "password" && !promptPassword) {
-      setError("请输入密码");
+      setError(t("host.errorNoPassword"));
       return;
     }
     if (host.authType === "key" && !host.keyPath) {
-      setError("该主机未配置私钥路径，请用「新建连接」重新保存");
+      setError(t("host.errorNoKeyPath"));
       return;
     }
 
@@ -231,11 +233,11 @@ export function ConnectionsSidebar() {
   /** 从「新建连接」表单直连，可选择同时保存为 host profile。 */
   const handleSubmitForm = async () => {
     const port = parsePort(form.port);
-    if (!form.host.trim()) return setError("请填写主机地址");
-    if (!form.username.trim()) return setError("请填写用户名");
-    if (port === null) return setError("端口必须是 1–65535 的整数");
-    if (form.authType === "password" && !form.password) return setError("请填写密码");
-    if (form.authType === "key" && !form.keyPath.trim()) return setError("请填写私钥路径");
+    if (!form.host.trim()) return setError(t("host.errorNoHost"));
+    if (!form.username.trim()) return setError(t("host.errorNoUser"));
+    if (port === null) return setError(t("host.errorPort"));
+    if (form.authType === "password" && !form.password) return setError(t("host.errorNoPassword"));
+    if (form.authType === "key" && !form.keyPath.trim()) return setError(t("host.errorNoKeyPath2"));
 
     setError(null);
     const auth =
@@ -269,7 +271,7 @@ export function ConnectionsSidebar() {
         upsertHostLocal(res);
         saved = res;
       } catch (err) {
-        setError(`保存主机失败 — ${errorText(err)}`);
+        setError(t("host.saveFailed", { error: errorText(err) }));
         return;
       }
     }
@@ -299,7 +301,7 @@ export function ConnectionsSidebar() {
       removeHostLocal(id);
       setConfirmDeleteId(null);
     } catch (err) {
-      setError(`删除主机失败 — ${errorText(err)}`);
+      setError(t("host.deleteFailed", { error: errorText(err) }));
     }
   };
 
@@ -309,7 +311,7 @@ export function ConnectionsSidebar() {
       <div className="flex shrink-0 items-center justify-between px-3 py-2">
         <div className="flex items-center gap-1.5 text-xs font-medium tracking-wide text-muted-foreground">
           <Server className="size-3.5" />
-          <span>主机</span>
+          <span>{t("sidebar.hosts")}</span>
           <Badge variant="secondary" className="h-4 px-1 text-[10px]">
             {hosts.length}
           </Badge>
@@ -318,7 +320,7 @@ export function ConnectionsSidebar() {
           variant="ghost"
           size="sm"
           className="h-7 px-1.5"
-          title="新建连接"
+          title={t("host.newConnection")}
           onClick={() => {
             if (effectiveFormOpen) {
               setFormOpen(false);
@@ -352,16 +354,16 @@ export function ConnectionsSidebar() {
         <div className="mx-2 mb-2 space-y-2 rounded-md border border-border bg-card/40 p-2">
           <div className="grid grid-cols-2 gap-2">
             <div className="col-span-2 space-y-1">
-              <Label className="text-[11px] font-normal text-muted-foreground">名称（可选）</Label>
+              <Label className="text-[11px] font-normal text-muted-foreground">{t("host.nameOptional")}</Label>
               <Input
                 className="h-7 text-xs"
                 value={form.name}
-                placeholder="我的服务器"
+                placeholder={t("host.namePlaceholder")}
                 onChange={(e) => patchForm({ name: e.target.value })}
               />
             </div>
             <div className="col-span-2 space-y-1">
-              <Label className="text-[11px] font-normal text-muted-foreground">主机</Label>
+              <Label className="text-[11px] font-normal text-muted-foreground">{t("host.host")}</Label>
               <Input
                 className="h-7 text-xs"
                 value={form.host}
@@ -370,7 +372,7 @@ export function ConnectionsSidebar() {
               />
             </div>
             <div className="space-y-1">
-              <Label className="text-[11px] font-normal text-muted-foreground">端口</Label>
+              <Label className="text-[11px] font-normal text-muted-foreground">{t("host.port")}</Label>
               <Input
                 className="h-7 text-xs"
                 type="number"
@@ -381,7 +383,7 @@ export function ConnectionsSidebar() {
               />
             </div>
             <div className="space-y-1">
-              <Label className="text-[11px] font-normal text-muted-foreground">用户名</Label>
+              <Label className="text-[11px] font-normal text-muted-foreground">{t("host.username")}</Label>
               <Input
                 className="h-7 text-xs"
                 value={form.username}
@@ -394,10 +396,10 @@ export function ConnectionsSidebar() {
           <div className="flex items-center gap-1">
             {(
               [
-                { kind: "password" as const, label: "密码", icon: Lock },
-                { kind: "key" as const, label: "私钥", icon: KeyRound },
+                { kind: "password" as const, labelKey: "host.authPassword", icon: Lock },
+                { kind: "key" as const, labelKey: "host.authKey", icon: KeyRound },
               ]
-            ).map(({ kind, label, icon: Icon }) => (
+            ).map(({ kind, labelKey, icon: Icon }) => (
               <Button
                 key={kind}
                 size="sm"
@@ -406,25 +408,25 @@ export function ConnectionsSidebar() {
                 onClick={() => patchForm({ authType: kind })}
               >
                 <Icon className="size-3" />
-                {label}
+                {t(labelKey)}
               </Button>
             ))}
           </div>
 
           {form.authType === "password" ? (
             <div className="space-y-1">
-              <Label className="text-[11px] font-normal text-muted-foreground">密码</Label>
+              <Label className="text-[11px] font-normal text-muted-foreground">{t("host.password")}</Label>
               <Input
                 className="h-7 text-xs"
                 type="password"
                 value={form.password}
-                placeholder="仅本次连接使用（也可保存到本地配置）"
+                placeholder={t("host.passwordPlaceholder2")}
                 onChange={(e) => patchForm({ password: e.target.value })}
               />
             </div>
           ) : (
             <div className="space-y-1">
-              <Label className="text-[11px] font-normal text-muted-foreground">私钥路径</Label>
+              <Label className="text-[11px] font-normal text-muted-foreground">{t("host.privateKeyPath")}</Label>
               <Input
                 className="h-7 text-xs"
                 value={form.keyPath}
@@ -432,7 +434,7 @@ export function ConnectionsSidebar() {
                 onChange={(e) => patchForm({ keyPath: e.target.value })}
               />
               <Label className="text-[11px] font-normal text-muted-foreground">
-                私钥口令（可选）
+                {t("host.keyPassphraseOptional")}
               </Label>
               <Input
                 className="h-7 text-xs"
@@ -450,7 +452,7 @@ export function ConnectionsSidebar() {
               onChange={(e) => patchForm({ saveAsHost: e.target.checked })}
               className="size-3 accent-current"
             />
-            保存为主机
+            {t("host.saveAsHost")}
           </label>
 
           <div className="flex items-center justify-end gap-1">
@@ -461,7 +463,7 @@ export function ConnectionsSidebar() {
               onClick={() => void handleSubmitForm()}
             >
               {submitting ? <LoaderCircle className="size-3.5 animate-spin" /> : null}
-              连接
+              {t("host.connect")}
             </Button>
             <Button
               size="sm"
@@ -476,7 +478,7 @@ export function ConnectionsSidebar() {
                 setError(null);
               }}
             >
-              取消
+              {t("common.cancel")}
             </Button>
           </div>
         </div>
@@ -486,9 +488,9 @@ export function ConnectionsSidebar() {
       <div className="min-h-0 flex-1 space-y-px overflow-y-auto px-2 pb-2">
         {hosts.length === 0 ? (
           <div className="px-1 py-4 text-center text-[11px] text-muted-foreground">
-            还没有保存的主机。
+            {t("host.noHosts")}
             <br />
-            点击右上角 ＋ 新建连接。
+            {t("host.noHostsHint")}
           </div>
         ) : null}
 
@@ -526,7 +528,7 @@ export function ConnectionsSidebar() {
                       ) : (
                         <Lock className="size-2.5" />
                       )}
-                      {host.authType === "key" ? "私钥" : "密码"}
+                      {host.authType === "key" ? t("host.authKey") : t("host.authPassword")}
                     </Badge>
                   </div>
                   <div className="truncate text-[11px] text-muted-foreground">
@@ -544,7 +546,7 @@ export function ConnectionsSidebar() {
                       className="h-5 px-1 text-[10px]"
                       onClick={() => void handleDelete(host.id)}
                     >
-                      删除
+                      {t("common.remove")}
                     </Button>
                     <Button
                       size="sm"
@@ -552,7 +554,7 @@ export function ConnectionsSidebar() {
                       className="h-5 px-1 text-[10px]"
                       onClick={() => setConfirmDeleteId(null)}
                     >
-                      取消
+                      {t("common.cancel")}
                     </Button>
                   </div>
                 ) : (
@@ -560,7 +562,7 @@ export function ConnectionsSidebar() {
                     size="sm"
                     variant="ghost"
                     className="size-6 shrink-0 p-0 text-muted-foreground hover:text-destructive"
-                    title="删除主机"
+                    title={t("host.deleteHost")}
                     onClick={() => {
                       setConfirmDeleteId(host.id);
                       setPromptHostId(null);
@@ -586,7 +588,7 @@ export function ConnectionsSidebar() {
                       autoFocus
                       className="h-7 text-xs"
                       type="password"
-                      placeholder="密码"
+                      placeholder={t("host.password")}
                       value={promptPassword}
                       disabled={submitting}
                       onChange={(e) => setPromptPassword(e.target.value)}
@@ -600,7 +602,7 @@ export function ConnectionsSidebar() {
                       autoFocus
                       className="h-7 text-xs"
                       type="password"
-                      placeholder="私钥口令（如私钥未加密可留空）"
+                      placeholder={t("host.keyPassphrasePlaceholder")}
                       value={promptPassphrase}
                       disabled={submitting}
                       onChange={(e) => setPromptPassphrase(e.target.value)}
@@ -613,8 +615,8 @@ export function ConnectionsSidebar() {
                   <div className="flex items-center justify-between">
                     <span className="truncate text-[10px] text-muted-foreground">
                       {host.authType === "key"
-                        ? host.keyPath || "（无私钥路径）"
-                        : `以 ${host.username} 登录`}
+                        ? host.keyPath || t("host.noKeyPath")
+                        : t("host.loginAs", { username: host.username })}
                     </span>
                     <Button
                       size="sm"
@@ -623,7 +625,7 @@ export function ConnectionsSidebar() {
                       onClick={() => void handleConnectHost(host)}
                     >
                       {busy ? <LoaderCircle className="size-3 animate-spin" /> : <User className="size-3" />}
-                      连接
+                      {t("host.connect")}
                     </Button>
                   </div>
                 </div>
