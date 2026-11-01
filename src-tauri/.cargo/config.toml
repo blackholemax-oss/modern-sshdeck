@@ -1,0 +1,10 @@
+# 本机（Windows/MSVC）构建配置。
+#
+# 注意：默认 profile 固定为 release，因为 debug 模式下 MSVC 的 -Z7 会让
+# 第三方 C 依赖（ring 等）的构建脚本失败。详见 docs/BUILD-ENV.md。
+
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[env]
+CARGO_HTTP_TIMEOUT = "120"
