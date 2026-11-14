@@ -23,6 +23,10 @@ pub enum ForwardState {
     Running,
     Stopped,
     Failed,
+    /// 需要凭据 / 等待重新绑定会话（持久化规则在重启后的初始态）
+    Pending,
+    /// 底层连接断开，正在按退避策略重连
+    Reconnecting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +189,26 @@ pub struct BehaviorConfig {
     /// 自定义 known_hosts 路径；空串 = `~/.ssh/known_hosts`
     #[serde(default)]
     pub known_hosts_path: String,
+    /// 多路会话复用同一条 SSH 连接（0 次重复握手）
+    #[serde(default = "default_true")]
+    pub session_reuse: bool,
+    /// 连接空闲多久后断开（秒）；0 = 关闭即断
+    #[serde(default = "default_reuse_idle_secs")]
+    pub session_reuse_idle_secs: u32,
+    /// 应用启动 / 会话建立后自动恢复持久化的转发规则
+    #[serde(default = "default_true")]
+    pub forward_auto_restore: bool,
+    /// 转发断线重连的最大退避（秒）
+    #[serde(default = "default_reconnect_max_secs")]
+    pub forward_reconnect_max_secs: u32,
+}
+
+fn default_reuse_idle_secs() -> u32 {
+    300
+}
+
+fn default_reconnect_max_secs() -> u32 {
+    30
 }
 
 fn default_host_key_policy() -> String {
@@ -201,6 +225,10 @@ impl Default for BehaviorConfig {
             default_username: String::new(),
             host_key_policy: default_host_key_policy(),
             known_hosts_path: String::new(),
+            session_reuse: true,
+            session_reuse_idle_secs: default_reuse_idle_secs(),
+            forward_auto_restore: true,
+            forward_reconnect_max_secs: default_reconnect_max_secs(),
         }
     }
 }
@@ -288,6 +316,10 @@ pub struct BehaviorConfigPatch {
     pub default_username: Option<String>,
     pub host_key_policy: Option<String>,
     pub known_hosts_path: Option<String>,
+    pub session_reuse: Option<bool>,
+    pub session_reuse_idle_secs: Option<u32>,
+    pub forward_auto_restore: Option<bool>,
+    pub forward_reconnect_max_secs: Option<u32>,
 }
 
 // ───────────────────────────── 主机 ─────────────────────────────
@@ -347,6 +379,22 @@ pub struct SessionInfo {
     /// 主机密钥校验结果：`verified` / `trusted` / `learned` / `insecure`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_key_status: Option<String>,
+    /// 共享的底层连接 id：两个会话同值 = 复用了同一条 SSH 传输（0 次握手）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_id: Option<String>,
+}
+
+/// `ssh_pool_stats` 的返回：验证连接复用是否生效。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolStatsDto {
+    pub links: Vec<crate::ssh::link::LinkStat>,
+    /// 累计新建连接数（= 握手次数）
+    pub handshakes: usize,
+    /// 累计复用次数
+    pub reuses: usize,
+    /// 当前可见（非隐藏）会话数
+    pub sessions: usize,
 }
 
 /// `ssh_probe_host_key` 的返回：只握手不认证，用于「未知主机」的指纹确认。
@@ -408,7 +456,15 @@ pub struct ForwardPatch {
 #[serde(rename_all = "camelCase")]
 pub struct ForwardInfo {
     pub id: String,
+    /// 当前承载这条规则的会话（`pending` 时为空串）
     pub session_id: String,
+    /// 规则跟随的主机档案 id（持久化后用于断线重连 / 重启恢复）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    /// 规则归属主机（持久化后跨重启仍能定位）
+    pub host: String,
+    pub port: u16,
+    pub username: String,
     pub kind: ForwardKind,
     pub listen_host: String,
     pub listen_port: u16,
@@ -417,8 +473,40 @@ pub struct ForwardInfo {
     pub state: ForwardState,
     /// 规则创建时间（毫秒），用于稳定排序
     pub created_at: i64,
+    /// 是否已写入 `state.json`（重启后自动恢复）
+    pub persisted: bool,
+    /// 是否随应用启动 / 会话建立自动拉起
+    pub auto_start: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// 落盘的转发规则定义（只存非敏感信息；凭据从不写入磁盘）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedForward {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub kind: ForwardKind,
+    pub listen_host: String,
+    pub listen_port: u16,
+    pub remote_host: String,
+    pub remote_port: u16,
+    /// 是否在应用启动 / 该主机建立会话后自动恢复
+    #[serde(default = "default_true")]
+    pub auto_start: bool,
+    pub created_at: i64,
+}
+
+impl PersistedForward {
+    /// 规则跟随的身份（host + port + username），用于匹配可用会话。
+    pub fn host_target(&self) -> String {
+        format!("{}:{}@{}", self.host, self.port, self.username)
+    }
 }
 
 // ───────────────────────────── Agent ─────────────────────────────

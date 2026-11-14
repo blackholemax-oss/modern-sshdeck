@@ -333,9 +333,11 @@ impl russh::client::Handler for ClientHandler {
 pub struct SessionEntry {
     pub info: Mutex<SessionInfo>,
     pub shell: ShellHandle,
-    /// russh 连接句柄：`run_command` 开 exec channel、端口转发开 direct-tcpip 用。
-    /// 只短暂持有锁，拿到的 `Channel` 可独立使用。
-    pub handle: Mutex<russh::client::Handle<ClientHandler>>,
+    /// 共享的底层 SSH 连接（多路复用，见 `ssh/link.rs`）。
+    ///
+    /// `run_command` 开 exec channel、端口转发开 direct-tcpip / tcpip-forward
+    /// 都通过它；同一条连接上的多个会话共用同一个传输层。
+    pub link: Arc<crate::ssh::link::SharedLink>,
     /// 会话结束标志（`watch`）：端口转发监听它 → 会话断开时转发自动停止。
     pub closed: watch::Sender<bool>,
     /// 常驻 receiver，保证 `closed` sender 在条目存活期间**永不进入 closed 状态**。
@@ -344,8 +346,13 @@ pub struct SessionEntry {
     /// 之后 `subscribe()` 出来的 receiver 首次 `changed()` 会立即返回 `Err`，
     /// shell task 会瞬间误判会话已关闭并退出（表现为「连上就断」）。
     pub closed_guard: Mutex<watch::Receiver<bool>>,
-    /// `-R` 远程转发的来连通道路由表
-    pub remote_routes: RemoteRouter,
+    /// 隐藏会话（后台转发专用，无 PTY）：不出现在 `ssh_list_sessions` 里，
+    /// 也不 emit 终端事件。
+    pub hidden: bool,
+    /// 建立它时使用的主机档案 id（用于转发恢复时查私钥路径等）。
+    pub host_id: Option<String>,
+    /// 是否已归还连接引用（幂等：close() 与 task 收尾可能同时发生）
+    pub released: std::sync::atomic::AtomicBool,
 }
 
 impl SessionEntry {
@@ -360,6 +367,26 @@ impl SessionEntry {
 
     pub async fn set_state(&self, state: SessionState) {
         self.info.lock().await.state = state;
+    }
+
+    /// 会话 id（内部使用：`info` 是 Mutex，避免调用方到处锁）。
+    pub async fn session_id(&self) -> String {
+        self.info.lock().await.id.clone()
+    }
+
+    /// 这个会话是否还活着（会话本身与底层链路都要活着）。
+    pub fn is_alive(&self) -> bool {
+        !self.is_closed() && !self.link.is_closed()
+    }
+
+    /// 归还连接引用（幂等）。
+    ///
+    /// 两条路径都会走到：`ssh_disconnect` / `close()`，以及 shell task / 隐藏会话
+    /// 监控的收尾。重复归还会让引用计数下溢，空闲回收就再也不触发了。
+    pub fn release_link(&self) {
+        if !self.released.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.link.release();
+        }
     }
 }
 
@@ -491,14 +518,15 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// 起「来连通道 → 路由表」的分发任务。
 ///
-/// 生命周期与会话一致：会话 `closed` 变 true 或通道发送端全部 drop 时退出。
+/// 生命周期与**底层连接**一致（不是与单个会话）：同一条连接可能被多个会话
+/// 共享，`-R` 规则也可能由其中任意一个会话注册，所以路由表挂在 `SharedLink` 上。
+/// 链路标记 closed 或通道发送端全部 drop 时退出。
 pub fn spawn_forwarded_router(
-    entry: Arc<SessionEntry>,
+    link: Arc<crate::ssh::link::SharedLink>,
     mut rx: mpsc::UnboundedReceiver<ForwardedConn>,
 ) {
-    let router_entry = entry.clone();
     tokio::spawn(async move {
-        let mut closed = router_entry.closed.subscribe();
+        let mut closed = link.closed.subscribe();
         loop {
             tokio::select! {
                 changed = closed.changed() => {
@@ -509,7 +537,7 @@ pub fn spawn_forwarded_router(
                 }
                 msg = rx.recv() => {
                     match msg {
-                        Some(conn) => router_entry.remote_routes.dispatch(conn).await,
+                        Some(conn) => link.remote_routes.dispatch(conn).await,
                         None => break,
                     }
                 }
@@ -645,7 +673,8 @@ pub fn spawn_shell_tasks(
             }
         }
 
-        // 收尾：唤醒转发监听、置状态、从会话表移除
+        // 收尾：归还连接引用、唤醒转发监听、置状态、从会话表移除
+        task_entry.release_link();
         task_entry.mark_closed();
         task_entry.set_state(SessionState::Closed).await;
         if let Some(e) = sessions.lock().await.remove(&session_id) {

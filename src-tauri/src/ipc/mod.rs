@@ -34,6 +34,15 @@ pub async fn app_set_config(
         &updated.behavior.host_key_policy,
         &updated.behavior.known_hosts_path,
     );
+    // 连接复用与转发恢复策略同样是「立即生效」的运行时开关
+    state.sessions.apply_reuse_settings(
+        updated.behavior.session_reuse,
+        updated.behavior.session_reuse_idle_secs,
+    );
+    state.supervisor.apply_settings(
+        updated.behavior.forward_auto_restore,
+        updated.behavior.forward_reconnect_max_secs,
+    );
     Ok(updated)
 }
 
@@ -71,7 +80,17 @@ pub async fn ssh_connect(
     if req.username.trim().is_empty() {
         return Err(AppError::InvalidInput("username is required".into()));
     }
-    state.sessions.create(app, req).await
+    // 缓存本次登录凭据：断线后转发守护用它自动重连（不落盘）
+    let template = req.clone();
+    let info = state.sessions.create(app, req).await?;
+
+    if let Ok(entry) = state.sessions.get(&info.id).await {
+        state
+            .supervisor
+            .on_session_connected(&entry, &template)
+            .await;
+    }
+    Ok(info)
 }
 
 #[tauri::command]
@@ -92,6 +111,15 @@ pub async fn ssh_probe_host_key(
 #[tauri::command]
 pub async fn ssh_list_sessions(state: State<'_, AppState>) -> AppResult<Vec<SessionInfo>> {
     Ok(state.sessions.list().await)
+}
+
+/// 连接池统计：用于验证「多路会话是否真的复用了一条底层连接」。
+///
+/// `handshakes` 是累计握手次数，`reuses` 是累计复用次数；开第二个同主机
+/// 标签页时 `handshakes` 应保持不变而 `reuses` +1。
+#[tauri::command]
+pub async fn ssh_pool_stats(state: State<'_, AppState>) -> AppResult<PoolStatsDto> {
+    Ok(state.sessions.pool_stats().await)
 }
 
 #[tauri::command]
@@ -121,7 +149,10 @@ pub async fn forward_start(
     state: State<'_, AppState>,
     req: ForwardRequest,
 ) -> AppResult<ForwardInfo> {
-    state.forwards.start(app, req).await
+    let info = state.forwards.start(app, req).await?;
+    // 落盘 + 挂恢复 watcher：断线 / 重启后这条规则会被自动拉起
+    state.supervisor.remember(&info).await;
+    Ok(info)
 }
 
 #[tauri::command]
@@ -130,7 +161,14 @@ pub async fn forward_stop(
     state: State<'_, AppState>,
     forward_id: String,
 ) -> AppResult<()> {
-    state.forwards.stop(app, &forward_id).await
+    // `pending` 规则没有运行实例，但仍要删掉落盘定义
+    match state.forwards.stop(app, &forward_id).await {
+        Ok(()) => {}
+        Err(AppError::NotFound(_)) => {}
+        Err(e) => return Err(e),
+    }
+    state.supervisor.forget(&forward_id).await;
+    Ok(())
 }
 
 /// 查询单条规则（运行期最新状态 + 失败原因）。
@@ -139,22 +177,33 @@ pub async fn forward_get(
     state: State<'_, AppState>,
     forward_id: String,
 ) -> AppResult<ForwardInfo> {
-    state.forwards.get(&forward_id).await
+    // 先看运行实例，再回落到持久化定义（`pending` 规则也有记录）
+    match state.forwards.get(&forward_id).await {
+        Ok(info) => Ok(info),
+        Err(_) => {
+            let merged = state.supervisor.merge(Vec::new()).await;
+            merged
+                .into_iter()
+                .find(|f| f.id == forward_id)
+                .ok_or_else(|| AppError::NotFound(format!("forward {forward_id}")))
+        }
+    }
 }
 
 /// 列举规则；传 `sessionId` 时只返回该会话名下的规则。
+///
+/// 结果 = 运行中的实例 + 持久化但尚未恢复的规则（`pending` / `reconnecting`）。
 #[tauri::command]
 pub async fn forward_list(
     state: State<'_, AppState>,
     session_id: Option<String>,
 ) -> AppResult<Vec<ForwardInfo>> {
-    Ok(state
-        .forwards
-        .list(session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()))
-        .await)
+    let filter = session_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let running = state.forwards.list(filter).await;
+    Ok(state.supervisor.merge(running).await)
 }
 
-/// 修改规则：原地重启并保留 `id`。
+/// 修改规则：原地重启并保留 `id`，同时刷新落盘定义。
 #[tauri::command]
 pub async fn forward_update(
     app: tauri::AppHandle,
@@ -162,7 +211,24 @@ pub async fn forward_update(
     forward_id: String,
     patch: ForwardPatch,
 ) -> AppResult<ForwardInfo> {
-    state.forwards.update(app, &forward_id, patch).await
+    match state.forwards.update(app, &forward_id, patch.clone()).await {
+        Ok(info) => {
+            state.supervisor.remember_update(&info).await;
+            Ok(info)
+        }
+        // 尚未运行的 `pending` 规则只存在于守护层：改定义后尝试拉起
+        Err(AppError::NotFound(_)) => state.supervisor.update_definition(&forward_id, patch).await,
+        Err(e) => Err(e),
+    }
+}
+
+/// 手动重试一条 `pending` / `reconnecting` 规则（重建链路）。
+#[tauri::command]
+pub async fn forward_retry(
+    state: State<'_, AppState>,
+    forward_id: String,
+) -> AppResult<()> {
+    state.supervisor.retry(&forward_id).await
 }
 
 // ───────────────────────────── Agent ─────────────────────────────

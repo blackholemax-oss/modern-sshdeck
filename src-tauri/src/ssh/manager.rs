@@ -20,14 +20,17 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::error::{AppError, AppResult};
-use crate::ipc::dto::{AuthSpec, ConnectRequest, HostKeyProbe, SessionInfo, SessionState};
+use crate::ipc::dto::{
+    AuthSpec, ConnectRequest, HostKeyProbe, PoolStatsDto, SessionInfo, SessionState,
+};
 use crate::ipc::events::{SessionStateEvent, SESSION_STATE};
 use crate::ssh::auth;
 use crate::ssh::config::SshOptions;
 use crate::ssh::known_hosts::{self, HostKeyPolicy};
+use crate::ssh::link::{link_key, LinkPool, SharedLink};
 use crate::ssh::session::{
     collect_output, open_exec_channel, spawn_forwarded_router, spawn_shell_tasks, ChannelCommand,
-    ClientHandler, ForwardedConn, RemoteRouter, SessionEntry, SessionMap, ShellHandle, ShellTasks,
+    ClientHandler, ForwardedConn, SessionEntry, SessionMap, ShellHandle, ShellTasks,
 };
 
 /// 主机密钥校验设置（可随配置热更新）。
@@ -61,11 +64,36 @@ impl HostKeySettings {
     }
 }
 
+/// 连接复用设置。
+#[derive(Debug, Clone, Copy)]
+pub struct ReuseSettings {
+    pub enabled: bool,
+    /// 引用归零后连接保留多久（0 = 立刻断开）
+    pub idle_ttl: Duration,
+    /// 建立连接的最大等待（含 TCP + 握手 + 认证）
+    pub connect_timeout: Duration,
+}
+
+impl Default for ReuseSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle_ttl: Duration::from_secs(300),
+            connect_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
 pub struct SessionManager {
     sessions: SessionMap,
     options: SshOptions,
     /// `RwLock` 而非 Mutex：连接建立时高频读取，写只在改设置时发生。
     host_key: std::sync::RwLock<HostKeySettings>,
+    /// 连接池：同身份（host+port+user+凭据）的多路会话共享一条 SSH 传输。
+    links: Arc<LinkPool>,
+    reuse: std::sync::RwLock<ReuseSettings>,
+    /// 同一身份的并发建连串行化，避免同时 miss 后握两次手。
+    connect_gates: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl SessionManager {
@@ -74,7 +102,87 @@ impl SessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             options: SshOptions::default(),
             host_key: std::sync::RwLock::new(HostKeySettings::default()),
+            links: Arc::new(LinkPool::new()),
+            reuse: std::sync::RwLock::new(ReuseSettings::default()),
+            connect_gates: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn links(&self) -> Arc<LinkPool> {
+        self.links.clone()
+    }
+
+    pub fn reuse_settings(&self) -> ReuseSettings {
+        match self.reuse.read() {
+            Ok(g) => *g,
+            Err(p) => *p.into_inner(),
+        }
+    }
+
+    /// 应用「连接复用」设置；关闭复用时立刻断开所有空闲连接。
+    pub fn apply_reuse_settings(&self, enabled: bool, idle_secs: u32) {
+        let ttl = Duration::from_secs(idle_secs.min(24 * 3600) as u64);
+        {
+            let mut guard = match self.reuse.write() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.enabled = enabled;
+            guard.idle_ttl = ttl;
+        }
+        self.links.set_idle_ttl(ttl);
+        if !enabled {
+            let pool = self.links.clone();
+            tokio::spawn(async move {
+                pool.close_idle_now().await;
+            });
+        }
+        tracing::info!(enabled, idle_secs, "ssh link reuse settings updated");
+    }
+
+    /// 后台回收空闲连接（由 `lib.rs` 在 setup 里起一次）。
+    pub fn spawn_link_reaper(&self) {
+        let pool = self.links.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let reaped = pool.reap_idle().await;
+                if !reaped.is_empty() {
+                    tracing::info!(count = reaped.len(), "closed idle ssh links");
+                }
+            }
+        });
+    }
+
+    pub async fn pool_stats(&self) -> PoolStatsDto {
+        let (links, handshakes, reuses) = self.links.stats().await;
+        let sessions = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .filter(|s| !s.hidden)
+            .count();
+        PoolStatsDto {
+            links,
+            handshakes,
+            reuses,
+            sessions,
+        }
+    }
+
+    /// 同一身份的建连串行化锁。
+    async fn connect_gate(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut gates = match self.connect_gates.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        gates
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// 应用设置面板里的主机密钥策略 / known_hosts 路径（只影响之后建立的连接）。
@@ -144,7 +252,132 @@ impl SessionManager {
     ) -> AppResult<SessionInfo> {
         let session_id = session_id.to_string();
 
-        // ── 1. TCP 连接（带超时）──────────────────────────────
+        // ── 1. 取连接：命中连接池就跳过 TCP + 握手 + 认证 ────────
+        let link = self.obtain_link(&req).await?;
+
+        let _ = app.emit(
+            SESSION_STATE,
+            SessionStateEvent {
+                session_id: session_id.clone(),
+                state: SessionState::Auth,
+                reason: None,
+            },
+        );
+
+        // ── 2. 在共享连接上开一个独立 shell channel ─────────────
+        let channel = match self.open_shell_on(&link, &req).await {
+            Ok(channel) => channel,
+            Err(e) => {
+                // 建连失败要把引用还回去，否则空闲连接永远回收不掉
+                link.release();
+                return Err(e);
+            }
+        };
+
+        // ── 3. 组装条目 + 起 task ─────────────────────────────
+        let info = SessionInfo {
+            id: session_id.clone(),
+            host: req.host.clone(),
+            port: req.port,
+            username: req.username.clone(),
+            state: SessionState::Connected,
+            created_at: crate::persist::store::now_millis(),
+            host_key_fingerprint: link.host_key.fingerprint.clone(),
+            host_key_status: link.host_key.status.clone(),
+            link_id: Some(link.id.clone()),
+        };
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ChannelCommand>(64);
+        // **必须保留一个 receiver**：若让它立即 drop，`closed_tx` 会进入 closed 状态，
+        // 之后 `subscribe()` 得到的 receiver 首次 `changed()` 会立刻返回 Err，
+        // shell task 会在启动瞬间误判为「已关闭」而退出（会话随即消失）。
+        let (closed_tx, closed_rx) = watch::channel(false);
+        let entry = Arc::new(SessionEntry {
+            info: Mutex::new(info.clone()),
+            shell: ShellHandle { tx: cmd_tx },
+            link: link.clone(),
+            closed: closed_tx,
+            closed_guard: Mutex::new(closed_rx),
+            hidden: false,
+            host_id: req.host_id.clone(),
+            released: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        // **先入表再起 task**：读任务在通道结束时会把自身从表中移除，
+        // 若先起 task 后入表，快速断开的会话可能出现「先删后插」的残留条目。
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), entry.clone());
+
+        let tasks: ShellTasks = spawn_shell_tasks(
+            app.clone(),
+            session_id.clone(),
+            channel,
+            entry.clone(),
+            self.sessions.clone(),
+            cmd_rx,
+        );
+        // task 自身持有 channel；句柄只为可观测性保留（Drop 时不取消）。
+        let _ = (tasks.write, tasks.read);
+
+        let _ = app.emit(
+            SESSION_STATE,
+            SessionStateEvent {
+                session_id,
+                state: SessionState::Connected,
+                reason: None,
+            },
+        );
+
+        Ok(info)
+    }
+
+    // ───────────────────── 连接复用（共享底层连接）─────────────────────
+
+    /// 取一条可用的底层连接：命中池就复用（0 次握手），否则新建。
+    ///
+    /// 同一身份用 per-key 串行锁保护，避免并发登录时重复握手。
+    async fn obtain_link(&self, req: &ConnectRequest) -> AppResult<Arc<SharedLink>> {
+        let settings = self.reuse_settings();
+        let key = link_key(&req.host, req.port, &req.username, &req.auth);
+
+        if settings.enabled {
+            if let Some(link) = self.links.find(&key).await {
+                link.acquire();
+                tracing::info!(
+                    link = %link.id,
+                    host = %req.host,
+                    port = req.port,
+                    user = %req.username,
+                    "reuse existing ssh link (handshake skipped)"
+                );
+                return Ok(link);
+            }
+        }
+
+        let gate = self.connect_gate(&key).await;
+        let _guard = gate.lock().await;
+
+        // 双检：等锁期间可能已经有人建好同一条连接
+        if settings.enabled {
+            if let Some(link) = self.links.find(&key).await {
+                link.acquire();
+                return Ok(link);
+            }
+        }
+
+        let link = self.establish_link(req, key).await?;
+        link.acquire();
+        Ok(link)
+    }
+
+    /// 新建一条底层连接（TCP + 握手 + 认证），放进池里并起监控任务。
+    async fn establish_link(
+        &self,
+        req: &ConnectRequest,
+        key: String,
+    ) -> AppResult<Arc<SharedLink>> {
         let addr = format!("{}:{}", req.host, req.port);
         let stream = tokio::time::timeout(
             self.options.connect_timeout,
@@ -161,7 +394,6 @@ impl SessionManager {
 
         let _ = stream.set_nodelay(true);
 
-        // ── 2. russh 握手（含 known_hosts 严格校验）────────────
         let mut config = russh::client::Config::default();
         config.keepalive_interval = self.options.keepalive;
         let config = Arc::new(config);
@@ -175,7 +407,7 @@ impl SessionManager {
             _ => None,
         };
 
-        // `-R` 来连通道：handler 生产、路由器消费
+        // `-R` 来连通道：handler 生产、链路路由器消费
         let (forwarded_tx, forwarded_rx) = mpsc::unbounded_channel::<ForwardedConn>();
 
         let (handler, outcome_slot) = ClientHandler::new(
@@ -187,7 +419,19 @@ impl SessionManager {
             Some(forwarded_tx),
         );
 
-        let mut handle = match russh::client::connect_stream(config, stream, handler).await {
+        let handshake = tokio::time::timeout(
+            self.options.connect_timeout,
+            russh::client::connect_stream(config, stream, handler),
+        )
+        .await
+        .map_err(|_| {
+            AppError::Ssh(format!(
+                "ssh handshake with {addr} timed out after {}s",
+                self.options.connect_timeout.as_secs()
+            ))
+        })?;
+
+        let mut handle = match handshake {
             Ok(handle) => handle,
             Err(e) => {
                 // `check_server_key` 返回 false 时 russh 只会报 `UnknownKey`，
@@ -204,22 +448,48 @@ impl SessionManager {
             }
         };
 
-        let _ = app.emit(
-            SESSION_STATE,
-            SessionStateEvent {
-                session_id: session_id.clone(),
-                state: SessionState::Auth,
-                reason: None,
-            },
+        self.authenticate(&mut handle, req).await?;
+
+        let outcome = outcome_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        let link = Arc::new(SharedLink::new(
+            uuid::Uuid::new_v4().to_string(),
+            key,
+            req.host.trim().to_string(),
+            req.port,
+            req.username.clone(),
+            handle,
+            outcome,
+            crate::persist::store::now_millis(),
+        ));
+
+        self.links.insert(link.clone()).await;
+        spawn_forwarded_router(link.clone(), forwarded_rx);
+        spawn_link_monitor(link.clone(), self.links.clone());
+
+        tracing::info!(
+            link = %link.id,
+            host = %req.host,
+            port = req.port,
+            user = %req.username,
+            "ssh link established"
         );
+        Ok(link)
+    }
 
-        // ── 3. 认证 ───────────────────────────────────────────
-        self.authenticate(&mut handle, &req).await?;
-
-        // ── 4. 打开 shell channel ─────────────────────────────
-        // 整个 shell 建立阶段受 `shell_timeout` 约束：认证通过后个别服务端会
-        // 卡在 pty/shell 请求上，没有超时会让前端 spinner 永久转。
+    /// 在共享连接上开一个 shell channel（PTY + shell）。
+    async fn open_shell_on(
+        &self,
+        link: &Arc<SharedLink>,
+        req: &ConnectRequest,
+    ) -> AppResult<russh::Channel<russh::client::Msg>> {
+        // 整个建立阶段受 `shell_timeout` 约束：个别服务端会卡在 pty/shell
+        // 请求上，没有超时会让前端 spinner 永久转。
         let shell_result = tokio::time::timeout(self.options.shell_timeout, async {
+            let handle = link.handle.lock().await;
             let channel = handle
                 .channel_open_session()
                 .await
@@ -275,21 +545,30 @@ impl SessionManager {
         })
         .await;
 
-        let channel = match shell_result {
-            Ok(inner) => inner?,
-            Err(_) => {
-                return Err(AppError::Ssh(format!(
-                    "open shell timed out after {}s",
-                    self.options.shell_timeout.as_secs()
-                )))
-            }
-        };
+        match shell_result {
+            Ok(inner) => inner,
+            Err(_) => Err(AppError::Ssh(format!(
+                "open shell timed out after {}s",
+                self.options.shell_timeout.as_secs()
+            ))),
+        }
+    }
 
-        // ── 5. 组装条目 + 起 task ─────────────────────────────
-        let outcome = outcome_slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+    /// 建立一条**无终端**的后台会话，专供端口转发守护使用。
+    ///
+    /// 它同样走连接池：如果用户已经在这个主机上有活着的会话，直接复用同一条
+    /// 底层连接（0 次握手）；反之它会把连接留住，让用户后续打开终端时复用。
+    /// 隐藏会话不出现在 `ssh_list_sessions` 里，也不 emit 终端事件。
+    pub async fn connect_headless(
+        &self,
+        req: ConnectRequest,
+        host_id: Option<String>,
+    ) -> AppResult<Arc<SessionEntry>> {
+        if req.port == 0 {
+            return Err(AppError::InvalidInput("port must not be 0".into()));
+        }
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let link = self.obtain_link(&req).await?;
 
         let info = SessionInfo {
             id: session_id.clone(),
@@ -298,55 +577,53 @@ impl SessionManager {
             username: req.username.clone(),
             state: SessionState::Connected,
             created_at: crate::persist::store::now_millis(),
-            host_key_fingerprint: outcome.fingerprint.clone(),
-            host_key_status: outcome.status.clone(),
+            host_key_fingerprint: link.host_key.fingerprint.clone(),
+            host_key_status: link.host_key.status.clone(),
+            link_id: Some(link.id.clone()),
         };
 
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ChannelCommand>(64);
-        // **必须保留一个 receiver**：若让它立即 drop，`closed_tx` 会进入 closed 状态，
-        // 之后 `subscribe()` 得到的 receiver 首次 `changed()` 会立刻返回 Err，
-        // shell task 会在启动瞬间误判为「已关闭」而退出（会话随即消失）。
+        // 接收端立刻丢弃：隐藏会话没有终端输入，写入会返回「channel closed」。
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<ChannelCommand>(1);
         let (closed_tx, closed_rx) = watch::channel(false);
         let entry = Arc::new(SessionEntry {
-            info: Mutex::new(info.clone()),
+            info: Mutex::new(info),
             shell: ShellHandle { tx: cmd_tx },
-            handle: Mutex::new(handle),
+            link: link.clone(),
             closed: closed_tx,
             closed_guard: Mutex::new(closed_rx),
-            remote_routes: RemoteRouter::new(),
+            hidden: true,
+            host_id,
+            released: std::sync::atomic::AtomicBool::new(false),
         });
 
-        // **先入表再起 task**：读任务在通道结束时会把自身从表中移除，
-        // 若先起 task 后入表，快速断开的会话可能出现「先删后插」的残留条目。
         self.sessions
             .lock()
             .await
             .insert(session_id.clone(), entry.clone());
 
-        // `-R` 来连通道的分发任务（无远程转发时它只是空跑等待）
-        spawn_forwarded_router(entry.clone(), forwarded_rx);
+        // 链路断开 → 标记会话关闭并出表（供转发任务与监督器感知）
+        let watcher_entry = entry.clone();
+        let sessions = self.sessions.clone();
+        let sid = session_id.clone();
+        tokio::spawn(async move {
+            let mut closed = watcher_entry.link.closed.subscribe();
+            loop {
+                match closed.changed().await {
+                    Ok(()) => {
+                        if *closed.borrow() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            watcher_entry.release_link();
+            watcher_entry.mark_closed();
+            watcher_entry.set_state(SessionState::Closed).await;
+            sessions.lock().await.remove(&sid);
+        });
 
-        let tasks: ShellTasks = spawn_shell_tasks(
-            app.clone(),
-            session_id.clone(),
-            channel,
-            entry.clone(),
-            self.sessions.clone(),
-            cmd_rx,
-        );
-        // task 自身持有 channel；句柄只为可观测性保留（Drop 时不取消）。
-        let _ = (tasks.write, tasks.read);
-
-        let _ = app.emit(
-            SESSION_STATE,
-            SessionStateEvent {
-                session_id,
-                state: SessionState::Connected,
-                reason: None,
-            },
-        );
-
-        Ok(info)
+        Ok(entry)
     }
 
     /// 认证：密码 / 私钥（自动处理 RSA hash 算法与 passphrase）。
@@ -415,31 +692,28 @@ impl SessionManager {
         entry.mark_closed();
         entry.set_state(SessionState::Closed).await;
 
-        // 断开 russh 连接（失败也视为已关闭，不向上传播）。
-        // 用超时包住锁 + disconnect：连接已死时 `disconnect` 可能永远等不到
-        // 服务端回包，不设上限会让 `ssh_disconnect` IPC 挂住。
-        let lock_result = tokio::time::timeout(Duration::from_secs(3), entry.handle.lock()).await;
-        if let Ok(handle) = lock_result {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(3),
-                handle.disconnect(russh::Disconnect::ByApplication, "session closed", "en"),
-            )
-            .await;
-        } else {
-            // 拿不到锁说明有长任务正占用句柄；连接会随句柄释放而关闭。
-            tracing::debug!(
-                session_id,
-                "skip graceful disconnect: handle busy at close time"
-            );
+        // 归还连接引用：复用开启时连接留在池里（空闲 TTL 内可零握手重连），
+        // 关闭复用时立刻断开，保持「一个会话一条连接」的旧语义。
+        entry.release_link();
+        if !self.reuse_settings().enabled {
+            let key = entry.link.key.clone();
+            if entry.link.refs.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                if let Some(link) = self.links.remove(&key).await {
+                    LinkPool::close_link(&link, "session closed").await;
+                }
+            }
         }
 
         Ok(())
     }
 
     pub async fn list(&self) -> Vec<SessionInfo> {
-        let map = self.sessions.lock().await;
-        let mut out = Vec::with_capacity(map.len());
-        for e in map.values() {
+        let entries: Vec<Arc<SessionEntry>> = {
+            let map = self.sessions.lock().await;
+            map.values().filter(|e| !e.hidden).cloned().collect()
+        };
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries {
             out.push(e.info.lock().await.clone());
         }
         out
@@ -452,6 +726,41 @@ impl SessionManager {
             .get(session_id)
             .cloned()
             .ok_or_else(|| AppError::NotFound(format!("session {session_id}")))
+    }
+
+    /// 找出该主机下还活着的会话（优先用户可见的终端会话，其次后台转发会话）。
+    ///
+    /// 转发守护用它把规则挂到已有连接上，避免为恢复转发再握一次手。
+    pub async fn find_live(
+        &self,
+        host: &str,
+        port: u16,
+        username: &str,
+    ) -> Option<Arc<SessionEntry>> {
+        let entries: Vec<Arc<SessionEntry>> = {
+            let map = self.sessions.lock().await;
+            map.values().cloned().collect()
+        };
+
+        let mut hidden_hit: Option<Arc<SessionEntry>> = None;
+        for entry in entries {
+            let matched = {
+                let info = entry.info.lock().await;
+                info.host.eq_ignore_ascii_case(host.trim())
+                    && info.port == port
+                    && info.username == username
+            };
+            if !matched || entry.is_closed() || entry.link.is_closed() {
+                continue;
+            }
+            if !entry.hidden {
+                return Some(entry);
+            }
+            if hidden_hit.is_none() {
+                hidden_hit = Some(entry);
+            }
+        }
+        hidden_hit
     }
 
     pub async fn write_input(&self, session_id: &str, data: &[u8]) -> AppResult<()> {
@@ -551,7 +860,7 @@ impl SessionManager {
         // 只在开 channel / 发 exec 请求时短暂持有句柄锁；
         // 读取输出阶段不持锁，避免阻塞端口转发开新 channel。
         let channel = {
-            let handle = entry.handle.lock().await;
+            let handle = entry.link.handle.lock().await;
             open_exec_channel(&handle, command).await?
         };
 
@@ -569,7 +878,7 @@ impl SessionManager {
         session_id: &str,
     ) -> AppResult<russh_sftp::client::SftpSession> {
         let entry = self.get(session_id).await?;
-        let handle = entry.handle.lock().await;
+        let handle = entry.link.handle.lock().await;
         crate::ssh::sftp::open_sftp(&handle).await
     }
 
@@ -585,6 +894,27 @@ impl SessionManager {
         // 事件广播需要 AppHandle，这里只做状态落库；事件由调用方 emit。
         let _ = reason;
     }
+}
+
+/// 监控一条底层连接：对端关闭 / 网络中断时标记 closed 并移出池。
+///
+/// 各个共享会话自己会在 `channel.wait()` 返回 `None` 时收尾；这里负责让
+/// 「连接池状态」与「路由器 / 回收器」也立刻感知，避免把死连接当成可复用的。
+fn spawn_link_monitor(link: Arc<SharedLink>, pool: Arc<LinkPool>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if link.is_closed() {
+                break;
+            }
+            if link.handle_is_closed() {
+                tracing::warn!(link = %link.id, host = %link.host, "ssh link closed by peer");
+                link.mark_closed();
+                pool.remove(&link.key).await;
+                break;
+            }
+        }
+    });
 }
 
 /// 只用于「取主机公钥」的探针 handler：记录密钥后放行，不做认证。

@@ -128,9 +128,13 @@ impl ForwardRegistry {
     /// 参数非法 → `Err`；运行期启动失败（端口被占用 / 服务端拒绝）→ 规则仍然
     /// 被创建，`state = failed` 且带 `error`，便于用户改参数重试或删除。
     pub async fn start(&self, app: AppHandle, req: ForwardRequest) -> AppResult<ForwardInfo> {
-        let info = ForwardInfo {
+        let mut info = ForwardInfo {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: req.session_id.trim().to_string(),
+            host_id: None,
+            host: String::new(),
+            port: 0,
+            username: String::new(),
             kind: req.kind,
             listen_host: local::normalize_listen_host(&req.listen_host),
             listen_port: req.listen_port,
@@ -138,11 +142,22 @@ impl ForwardRegistry {
             remote_port: req.remote_port,
             state: ForwardState::Starting,
             created_at: crate::persist::store::now_millis(),
+            persisted: true,
+            auto_start: true,
             error: None,
         };
         validate(&info)?;
 
         let session = self.require_session(&info.session_id).await?;
+
+        // 记录规则归属的主机：断线重连 / 重启恢复都靠它重新定位
+        {
+            let sinfo = session.info.lock().await;
+            info.host = sinfo.host.clone();
+            info.port = sinfo.port;
+            info.username = sinfo.username.clone();
+        }
+        info.host_id = session.host_id.clone();
         let id = info.id.clone();
         let entry = Arc::new(ForwardEntry::new(info));
         self.forwards.lock().await.insert(id, entry.clone());
@@ -394,7 +409,7 @@ impl ForwardRegistry {
                         match accepted {
                             Ok((local_stream, peer)) => {
                                 let open = {
-                                    let guard = session.handle.lock().await;
+                                    let guard = session.link.handle.lock().await;
                                     guard.channel_open_direct_tcpip(
                                         remote_host.clone(),
                                         remote_port,
@@ -445,7 +460,7 @@ impl ForwardRegistry {
     ) -> ForwardInfo {
         // ① 让服务端开始监听（port 0 时由服务端分配）
         let actual_port = {
-            let mut handle = session.handle.lock().await;
+            let mut handle = session.link.handle.lock().await;
             match remote::request_forward(&mut handle, &info.listen_host, info.listen_port).await {
                 Ok(port) => port,
                 Err(e) => {
@@ -463,7 +478,7 @@ impl ForwardRegistry {
         // ② 注册路由，把该地址的来连通道接到本任务
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ForwardedConn>();
         let route_id = session
-            .remote_routes
+            .link.remote_routes
             .register(&info.listen_host, actual_port as u32, conn_tx)
             .await;
 
@@ -531,14 +546,14 @@ impl ForwardRegistry {
             }
 
             // ③ 收尾：先撤路由（后续来连会走默认关闭分支），再撤销服务端监听
-            session.remote_routes.unregister(route_id).await;
+            session.link.remote_routes.unregister(route_id).await;
             // 队列里还没处理完的来连通道要显式关闭，否则服务端那些 TCP 会半开
             while let Ok(conn) = conn_rx.try_recv() {
                 let channel = conn.channel;
                 let _ = channel.eof().await;
                 let _ = channel.close().await;
             }
-            let cancel = tokio::time::timeout(Duration::from_secs(3), session.handle.lock()).await;
+            let cancel = tokio::time::timeout(Duration::from_secs(3), session.link.handle.lock()).await;
             if let Ok(handle) = cancel {
                 if let Err(e) = remote::cancel_forward(&handle, &listen_host, actual_port).await {
                     tracing::debug!(error = %e, "cancel-tcpip-forward failed");
@@ -649,6 +664,10 @@ mod tests {
         ForwardInfo {
             id: "f1".into(),
             session_id: "s1".into(),
+            host_id: None,
+            host: "127.0.0.1".into(),
+            port: 22,
+            username: "tester".into(),
             kind,
             listen_host: "127.0.0.1".into(),
             listen_port,
@@ -656,6 +675,8 @@ mod tests {
             remote_port: 80,
             state: ForwardState::Starting,
             created_at: 0,
+            persisted: true,
+            auto_start: true,
             error: None,
         }
     }

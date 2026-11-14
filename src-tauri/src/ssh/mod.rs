@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod config;
 pub mod known_hosts;
+pub mod link;
 pub mod manager;
 pub mod sftp;
 pub mod session;

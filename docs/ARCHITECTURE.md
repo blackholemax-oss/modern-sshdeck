@@ -318,9 +318,11 @@ pub trait LlmProvider: Send + Sync {
 
 ```rust
 pub struct AppState {
-    pub sessions: SessionManager,
-    pub forwards: ForwardRegistry,
-    pub agent: AgentRuntime,
+    pub sessions: Arc<SessionManager>,      // 含 LinkPool（连接复用）
+    pub forwards: Arc<ForwardRegistry>,     // 运行实例
+    pub supervisor: Arc<ForwardSupervisor>, // 持久化 + 自动恢复
+    pub persist: Arc<PersistStore>,
+    pub agent: Arc<AgentRuntime>,
     pub config: RwLock<AppConfig>,
     pub pending_approvals: Mutex<HashMap<String, ApprovalSlot>>,
 }
@@ -355,6 +357,65 @@ server host key ──> known_hosts 校验 ──┬─ Match      ──> 放�
   （空 = `~/.ssh/known_hosts`，支持 `~/` 展开）；改完立即对后续连接生效。
 - 环境变量 `SSHDECK_KNOWN_HOSTS` 可覆盖默认路径（测试 / 便携场景）。
 
+### 4.9 SSH 连接复用（多路复用）
+
+```
+tab A ─┐
+tab B ─┼─> 同一个 SharedLink（TCP + 握手 + 认证，只做一次）
+分屏 ─┤        ├─ channel_open_session #1  (PTY/shell)
+转发 ─┤        ├─ channel_open_session #2
+SFTP ─┘        └─ exec channel / direct-tcpip / tcpip-forward
+```
+
+- **身份键** `link_key = (host, port, username, HMAC-SHA1(凭据指纹))`；同身份即同一条
+  传输。指纹只用于进程内匹配，原始密码/口令不进入 key、不写日志、不落盘。
+- 每个逻辑会话仍独立 `channel_open_session`（独立 PTY、独立窗口尺寸、独立退出码），
+  复用的只是传输层 —— 因此分屏/多标签之间不会串屏，也不会共享 shell 状态。
+- 引用计数归零后连接**不立即断开**，保留 `sessionReuseIdleSecs`（默认 300s）供下次
+  复用；后台回收任务每 10s 扫描一次。关闭复用开关时立刻断开空闲连接并回到
+  「一会话一连接」。
+- 认证失败的连接不会进入池；同身份的并发登录用 per-key 锁串行化，避免重复握手。
+- `ssh_pool_stats` 暴露 `handshakes / reuses / links[{linkId, sessions, reuses}]`；
+  `SessionInfo.linkId` 相同即表示两个会话共享一条传输。
+
+### 4.10 端口转发持久化与自动恢复（ForwardSupervisor）
+
+```
+state.json ──启动──> ForwardSupervisor.rules ──autoStart──> ensure_available()
+                                                              ├─ 有活会话 → 直接挂上去
+                                                              └─ 无活会话 → 隐藏后台连接
+                                                                  (connect_headless)
+会话关闭 / 链路断开 ──watch──> state=reconnecting ──退避重连──┘
+```
+
+- **落盘内容**（`state.json.forwards`）：`id / hostId / host / port / username /
+  kind / listenHost / listenPort / remoteHost / remotePort / autoStart / createdAt`。
+  **不存凭据**：密码与私钥口令永不写磁盘。
+- **运行凭据**来自内存缓存（最近一次成功登录的 `AuthSpec`）。因此：
+  - 同一次运行内断线 → 自动重连（密码/带口令私钥都可以）；
+  - 应用重启后 → 只有「无私钥口令的 key 登录」能立即恢复；其余规则停在
+    `pending`，用户一旦登录该主机，`on_session_connected` 立刻把它们接管过来。
+- **恢复载体**：`connect_headless` 建立一条**无 PTY 的隐藏会话**（不出现在
+  `ssh_list_sessions`，不 emit 终端事件），它同样走 `LinkPool` —— 若用户已在该主机
+  有会话，则复用同一条传输，恢复转发不会产生额外握手。
+- **退避**：1s→2s→4s→…→`forwardReconnectMaxSecs`（默认 30s，上限 300s），带 ±20%
+  抖动；同一主机的重连任务去重，避免风暴。
+- **不可重试**（认证失败、`known_hosts` 变更、参数非法）→ `pending` + 原因，不再
+  自动重试，避免把账号锁死；前端「重试恢复」可手动触发。
+- **规则生命周期**：`forward_start` 落盘；`forward_update` 刷新定义；`forward_stop`
+  删除定义。删除规则时其后台连接随引用归零进入空闲回收。
+
+### 4.11 异常与网络中断行为
+
+| 场景 | 会话 | 转发规则 |
+|---|---|---|
+| 网络抖动 / 链路 RST | 终端显示断开（不自动重连 shell，保留滚动内容） | 置 `reconnecting`，按退避重建；恢复后重新监听 / 重新 `tcpip-forward` |
+| 服务端重启 | 同上 | 同上；`-R` 端口被服务端占用时转 `failed` 并保留原因 |
+| 本地端口被占用 | — | `failed` + `listen failed: …`，不空转重试，下次重建/手动重试再试 |
+| 认证失败 / 主机密钥变更 | 连接被拒 | `pending` + 原因，不自动重试 |
+| 应用重启 | 不恢复终端 | `autoStart` 规则自动恢复（key 登录）；其余等登录后接管 |
+| 关闭复用开关 | — | 不影响；只是每条会话独占一条连接 |
+
 ---
 
 ## 5. IPC 契约（前端 ↔ 后端）
@@ -374,13 +435,15 @@ server host key ──> known_hosts 校验 ──┬─ Match      ──> 放�
 | `ssh_disconnect` | `{sessionId}` | `()` | 断开 |
 | `ssh_list_sessions` | — | `SessionInfo[]` | 列举 |
 | `ssh_probe_host_key` | `{host, port}` | `HostKeyProbe` | 只握手取主机公钥（指纹确认用） |
+| `ssh_pool_stats` | — | `PoolStats` | 连接池统计（验证复用是否生效） |
 | `terminal_input` | `{sessionId, data}` | `()` | 键盘输入 |
 | `terminal_resize` | `{sessionId, cols, rows}` | `()` | 尺寸变更 |
-| `forward_start` | `ForwardRequest` | `ForwardInfo` | 新增规则并启动（`-L` / `-R`） |
-| `forward_stop` | `{forwardId}` | `()` | 删除规则并停止 |
-| `forward_get` | `{forwardId}` | `ForwardInfo` | 查询单条规则（含失败原因） |
-| `forward_list` | `{sessionId?}` | `ForwardInfo[]` | 列举（可按会话过滤，按 `createdAt` 排序） |
-| `forward_update` | `{forwardId, patch}` | `ForwardInfo` | 修改规则（原地重启，保留 id） |
+| `forward_start` | `ForwardRequest` | `ForwardInfo` | 新增规则并启动（`-L` / `-R`），同时落盘 |
+| `forward_stop` | `{forwardId}` | `()` | 停止并从 `state.json` 删除 |
+| `forward_get` | `{forwardId}` | `ForwardInfo` | 查询单条规则（含运行实例 / 持久化定义） |
+| `forward_list` | `{sessionId?}` | `ForwardInfo[]` | 运行实例 + `pending` 规则合并，按 `createdAt` 排序 |
+| `forward_update` | `{forwardId, patch}` | `ForwardInfo` | 修改规则（原地重启，保留 id；`pending` 规则改定义后尝试拉起） |
+| `forward_retry` | `{forwardId}` | `()` | 手动重建链路并重新拉起规则 |
 | `agent_send` | `{runId, sessionId, message}` | `()` | 发起/继续对话 |
 | `agent_abort` | `{runId}` | `()` | 中止 |
 | `agent_approve` | `{approvalId, approved}` | `()` | 审批工具调用 |
@@ -456,6 +519,11 @@ export interface HostKeyProbe {
   status: "match" | "unknown" | "mismatch" | "revoked";
 }
 
+export type ForwardState =
+  | "starting" | "running" | "stopped" | "failed"
+  | "pending"        // 等待凭据 / 等待登录
+  | "reconnecting";  // 链路断开，退避重连中
+
 export type ForwardKind = "local" | "remote" | "dynamic"; // dynamic 未实现（后端拒绝）
 
 export interface ForwardRequest {
@@ -478,15 +546,29 @@ export interface ForwardPatch {
 
 export interface ForwardInfo {
   id: string;
-  sessionId: string;
+  sessionId: string;      // 承载会话；pending 时为空串
+  hostId?: string;
+  host: string;           // 规则归属主机（持久化后跨重启可定位）
+  port: number;
+  username: string;
   kind: ForwardKind;
   listenHost: string;
   listenPort: number;
   remoteHost: string;
   remotePort: number;
-  state: "starting" | "running" | "stopped" | "failed";
+  state: ForwardState;
   createdAt: number;    // 毫秒，用于稳定排序
+  persisted: boolean;   // 已写入 state.json
+  autoStart: boolean;   // 启动 / 登录后自动恢复
   error?: string;
+}
+
+export interface PoolStats {
+  links: { id: string; host: string; port: number; username: string;
+           sessions: number; reuses: number; createdAt: number; idleMs: number }[];
+  handshakes: number;   // 累计握手次数
+  reuses: number;       // 累计复用次数
+  sessions: number;     // 可见会话数
 }
 
 export type Risk = "read_only" | "mutating" | "dangerous";
@@ -506,7 +588,14 @@ export interface AppConfig {
     hostKeyPolicy: "strict" | "accept_new" | "insecure";
     /** 空串 = ~/.ssh/known_hosts */
     knownHostsPath: string;
-    // …其余行为开关见 src/shared/ipc.ts
+    /** 多路会话复用一条连接（默认 true） */
+    sessionReuse: boolean;
+    /** 空闲连接保留秒数（默认 300，0 = 关闭即断） */
+    sessionReuseIdleSecs: number;
+    /** 启动 / 登录后自动恢复转发（默认 true） */
+    forwardAutoRestore: boolean;
+    /** 转发重连最大退避秒数（默认 30） */
+    forwardReconnectMaxSecs: number;
   };
 }
 ```

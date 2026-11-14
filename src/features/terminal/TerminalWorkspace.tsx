@@ -91,6 +91,7 @@ export function TerminalWorkspace() {
           createdAt: prev?.createdAt ?? Date.now(),
           hostKeyFingerprint: prev?.hostKeyFingerprint,
           hostKeyStatus: prev?.hostKeyStatus,
+          linkId: prev?.linkId,
         };
         useSessionsStore.getState().upsertSession(info);
       });

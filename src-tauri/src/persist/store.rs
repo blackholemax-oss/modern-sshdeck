@@ -22,6 +22,9 @@ struct PersistedState {
     config: PersistedConfig,
     #[serde(default)]
     hosts: Vec<HostProfile>,
+    /// 端口转发规则（只存定义，不存运行状态与凭据）
+    #[serde(default)]
+    forwards: Vec<crate::ipc::dto::PersistedForward>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +80,26 @@ struct PersistedConfig {
     /// 自定义 known_hosts 路径；空 = 默认 `~/.ssh/known_hosts`
     #[serde(default)]
     behavior_known_hosts_path: String,
+    /// 多路会话复用同一条 SSH 连接
+    #[serde(default = "default_true")]
+    behavior_session_reuse: bool,
+    /// 空闲连接保留时长（秒）
+    #[serde(default = "default_reuse_idle_secs")]
+    behavior_session_reuse_idle_secs: u32,
+    /// 启动后自动恢复转发规则
+    #[serde(default = "default_true")]
+    behavior_forward_auto_restore: bool,
+    /// 转发重连最大退避（秒）
+    #[serde(default = "default_reconnect_max_secs")]
+    behavior_forward_reconnect_max_secs: u32,
+}
+
+fn default_reuse_idle_secs() -> u32 {
+    300
+}
+
+fn default_reconnect_max_secs() -> u32 {
+    30
 }
 
 fn default_host_key_policy() -> String {
@@ -133,6 +156,10 @@ impl Default for PersistedConfig {
             behavior_default_username: String::new(),
             behavior_host_key_policy: default_host_key_policy(),
             behavior_known_hosts_path: String::new(),
+            behavior_session_reuse: true,
+            behavior_session_reuse_idle_secs: default_reuse_idle_secs(),
+            behavior_forward_auto_restore: true,
+            behavior_forward_reconnect_max_secs: default_reconnect_max_secs(),
         }
     }
 }
@@ -243,8 +270,52 @@ impl PersistStore {
                 default_username: c.behavior_default_username,
                 host_key_policy: c.behavior_host_key_policy,
                 known_hosts_path: c.behavior_known_hosts_path,
+                session_reuse: c.behavior_session_reuse,
+                session_reuse_idle_secs: c.behavior_session_reuse_idle_secs,
+                forward_auto_restore: c.behavior_forward_auto_restore,
+                forward_reconnect_max_secs: c.behavior_forward_reconnect_max_secs,
             },
         }
+    }
+
+    // ───────────── 端口转发规则（持久化） ─────────────
+
+    pub fn load_forwards(&self) -> Vec<crate::ipc::dto::PersistedForward> {
+        let mut rules = self.load_state().forwards;
+        rules.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        rules
+    }
+
+    pub fn save_forwards(
+        &self,
+        rules: &[crate::ipc::dto::PersistedForward],
+    ) -> AppResult<()> {
+        self.ensure_dir()?;
+        let mut st = self.load_state();
+        st.forwards = rules.to_vec();
+        self.write_json(&self.state_path(), &st, false)
+    }
+
+    /// 新增或按 id 覆盖一条规则定义。
+    pub fn upsert_forward(&self, rule: crate::ipc::dto::PersistedForward) -> AppResult<()> {
+        self.ensure_dir()?;
+        let mut st = self.load_state();
+        match st.forwards.iter_mut().find(|r| r.id == rule.id) {
+            Some(slot) => *slot = rule,
+            None => st.forwards.push(rule),
+        }
+        self.write_json(&self.state_path(), &st, false)
+    }
+
+    pub fn delete_forward(&self, id: &str) -> AppResult<()> {
+        self.ensure_dir()?;
+        let mut st = self.load_state();
+        let before = st.forwards.len();
+        st.forwards.retain(|r| r.id != id);
+        if st.forwards.len() != before {
+            self.write_json(&self.state_path(), &st, false)?;
+        }
+        Ok(())
     }
 
     /// 供后端内部使用的明文 key。
@@ -450,6 +521,19 @@ impl PersistStore {
                     st.config.behavior_known_hosts_path = trimmed.to_string();
                 }
             }
+            if let Some(v) = b.session_reuse {
+                st.config.behavior_session_reuse = v;
+            }
+            if let Some(v) = b.session_reuse_idle_secs {
+                // 上限 24h：避免一个手滑的输入把连接永久钉住
+                st.config.behavior_session_reuse_idle_secs = v.min(24 * 3600);
+            }
+            if let Some(v) = b.forward_auto_restore {
+                st.config.behavior_forward_auto_restore = v;
+            }
+            if let Some(v) = b.forward_reconnect_max_secs {
+                st.config.behavior_forward_reconnect_max_secs = v.clamp(1, 300);
+            }
         }
 
         self.write_json(&self.state_path(), &st, false)?;
@@ -614,6 +698,82 @@ mod tests {
             store.public_config().behavior.known_hosts_path,
             "~/.ssh/known_hosts_test"
         );
+    }
+
+    #[test]
+    fn reuse_and_restore_settings_roundtrip() {
+        let store = temp_store("reuse");
+        let defaults = store.public_config().behavior;
+        assert!(defaults.session_reuse, "默认开启连接复用");
+        assert_eq!(defaults.session_reuse_idle_secs, 300);
+        assert!(defaults.forward_auto_restore, "默认自动恢复转发");
+        assert_eq!(defaults.forward_reconnect_max_secs, 30);
+
+        store
+            .apply_patch(AppConfigPatch {
+                behavior: Some(BehaviorConfigPatch {
+                    session_reuse: Some(false),
+                    session_reuse_idle_secs: Some(60),
+                    forward_auto_restore: Some(false),
+                    forward_reconnect_max_secs: Some(9999),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .expect("apply");
+
+        let cfg = store.public_config();
+        assert!(!cfg.behavior.session_reuse);
+        assert_eq!(cfg.behavior.session_reuse_idle_secs, 60);
+        assert!(!cfg.behavior.forward_auto_restore);
+        // 上限保护：退避不超过 300s
+        assert_eq!(cfg.behavior.forward_reconnect_max_secs, 300);
+    }
+
+    #[test]
+    fn forward_rules_persist_upsert_and_delete() {
+        use crate::ipc::dto::{ForwardKind, PersistedForward};
+
+        let store = temp_store("forwards");
+        let rule = |id: &str, port: u16| PersistedForward {
+            id: id.into(),
+            host_id: Some("h1".into()),
+            host: "example.com".into(),
+            port: 22,
+            username: "bob".into(),
+            kind: ForwardKind::Local,
+            listen_host: "127.0.0.1".into(),
+            listen_port: port,
+            remote_host: "10.0.0.5".into(),
+            remote_port: 5432,
+            auto_start: true,
+            created_at: port as i64,
+        };
+
+        store.upsert_forward(rule("f1", 8080)).expect("upsert 1");
+        store.upsert_forward(rule("f2", 8081)).expect("upsert 2");
+
+        let loaded = store.load_forwards();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, "f1", "按 createdAt 升序");
+        assert_eq!(loaded[1].listen_port, 8081);
+
+        // 相同 id 覆盖而不是追加（createdAt 保持测试值 9090，排序会变，
+        // 因此按 id 查找而不是按索引断言）
+        store.upsert_forward(rule("f1", 9090)).expect("update");
+        let loaded = store.load_forwards();
+        assert_eq!(loaded.len(), 2);
+        let f1 = loaded.iter().find(|r| r.id == "f1").expect("f1");
+        assert_eq!(f1.listen_port, 9090);
+        assert!(f1.auto_start);
+
+        store.delete_forward("f1").expect("delete");
+        let loaded = store.load_forwards();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "f2");
+
+        // 删除不存在的不报错
+        store.delete_forward("nope").expect("delete missing");
     }
 
     #[test]

@@ -24,6 +24,7 @@ import {
   Plus,
   Power,
   RefreshCw,
+  RotateCw,
 } from "lucide-react";
 
 import { useTranslation } from "react-i18next";
@@ -54,6 +55,8 @@ const STATE_BADGE: Record<
   running: { labelKey: "forward.status.running", variant: "success" },
   stopped: { labelKey: "forward.status.stopped", variant: "outline" },
   failed: { labelKey: "forward.status.failed", variant: "destructive" },
+  pending: { labelKey: "forward.status.pending", variant: "outline" },
+  reconnecting: { labelKey: "forward.status.reconnecting", variant: "secondary" },
 };
 
 function errorText(err: unknown): string {
@@ -286,6 +289,20 @@ export function ForwardPanel() {
       setError(errorText(err));
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  /** 手动重试：重建底层链路并重新拉起规则。 */
+  const handleRetry = async (id: string) => {
+    setBusyId(id);
+    setError(null);
+    try {
+      await api.retryForward(id);
+      await refresh(true);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusyId(null);
     }
   };
 
@@ -555,6 +572,22 @@ export function ForwardPanel() {
                     <Pencil className="size-3 shrink-0 text-muted-foreground" />
                     <span className="min-w-0 truncate">{t("forward.edit")}</span>
                   </button>
+                  {f.state === "pending" ||
+                  f.state === "reconnecting" ||
+                  f.state === "failed" ? (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[11px] text-foreground hover:bg-accent"
+                      onClick={() => {
+                        setMenuId(null);
+                        void handleRetry(f.id);
+                      }}
+                    >
+                      <RotateCw className="size-3 shrink-0 text-muted-foreground" />
+                      <span className="min-w-0 truncate">{t("forward.retry")}</span>
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     role="menuitem"
@@ -570,6 +603,10 @@ export function ForwardPanel() {
                 </div>
               ) : null}
 
+              <div className="mt-0.5 truncate text-[10px] text-muted-foreground">
+                {f.username}@{f.host}:{f.port}
+                {f.persisted ? ` · ${t("forward.persisted")}` : ""}
+              </div>
               {f.state === "failed" && f.error ? (
                 <div className="mt-0.5 truncate text-[10px] text-destructive" title={f.error}>
                   {f.error}

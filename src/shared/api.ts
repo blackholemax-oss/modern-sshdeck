@@ -90,6 +90,9 @@ export const api = {
       host,
       port,
     }),
+  /** 连接池统计：验证多路会话是否复用同一条底层连接。 */
+  poolStats: () =>
+    invokeCommand<contract.PoolStats>(contract.Commands.sshPoolStats),
   sendInput: (sessionId: string, data: string) =>
     invokeCommand<void>(contract.Commands.terminalInput, { sessionId, data }),
   resize: (sessionId: string, cols: number, rows: number) =>
@@ -115,6 +118,9 @@ export const api = {
       forwardId,
       patch,
     }),
+  /** 手动重试一条 pending / reconnecting 规则（重建底层链路）。 */
+  retryForward: (forwardId: string) =>
+    invokeCommand<void>(contract.Commands.forwardRetry, { forwardId }),
 
   // Agent
   agentSend: (req: contract.AgentSendRequest) =>

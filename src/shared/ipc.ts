@@ -14,7 +14,15 @@ export type SessionState =
   | "closed"
   | "failed";
 
-export type ForwardState = "starting" | "running" | "stopped" | "failed";
+export type ForwardState =
+  | "starting"
+  | "running"
+  | "stopped"
+  | "failed"
+  /** 持久化规则还没拿到可用连接（等待凭据 / 等待登录） */
+  | "pending"
+  /** 底层连接断开，正在按退避策略重连 */
+  | "reconnecting";
 
 export type Risk = "read_only" | "mutating" | "dangerous";
 
@@ -161,6 +169,14 @@ export interface BehaviorConfig {
   hostKeyPolicy: HostKeyPolicy;
   /** 自定义 known_hosts 路径；空串 = ~/.ssh/known_hosts */
   knownHostsPath: string;
+  /** 多路会话复用同一条 SSH 底层连接 */
+  sessionReuse: boolean;
+  /** 复用连接的空闲保留时长（秒，0 = 关闭即断） */
+  sessionReuseIdleSecs: number;
+  /** 启动 / 登录后自动恢复持久化的转发规则 */
+  forwardAutoRestore: boolean;
+  /** 转发断线重连的最大退避（秒） */
+  forwardReconnectMaxSecs: number;
 }
 
 export interface AppConfig {
@@ -248,6 +264,32 @@ export interface SessionInfo {
   hostKeyFingerprint?: string;
   /** 主机密钥校验结果：verified / trusted / learned / insecure */
   hostKeyStatus?: "verified" | "trusted" | "learned" | "insecure";
+  /** 共享的底层连接 id：同值 = 复用了同一条 SSH 传输（0 次握手） */
+  linkId?: string;
+}
+
+/** `ssh_pool_stats` 返回：验证连接复用是否生效。 */
+export interface LinkStat {
+  id: string;
+  host: string;
+  port: number;
+  username: string;
+  /** 当前共享者数量 */
+  sessions: number;
+  /** 这条连接被复用的次数 */
+  reuses: number;
+  createdAt: number;
+  idleMs: number;
+}
+
+export interface PoolStats {
+  links: LinkStat[];
+  /** 累计握手次数 */
+  handshakes: number;
+  /** 累计复用次数 */
+  reuses: number;
+  /** 当前可见会话数 */
+  sessions: number;
 }
 
 /** `ssh_probe_host_key` 返回：只握手不认证，用于未知主机的指纹确认。 */
@@ -298,7 +340,14 @@ export interface ForwardPatch {
 
 export interface ForwardInfo {
   id: string;
+  /** 当前承载会话；`pending` 时为空串 */
   sessionId: string;
+  /** 规则归属的主机档案 id */
+  hostId?: string;
+  /** 规则归属主机（跨重启持久化后仍可定位） */
+  host: string;
+  port: number;
+  username: string;
   kind: ForwardKind;
   listenHost: string;
   listenPort: number;
@@ -307,6 +356,10 @@ export interface ForwardInfo {
   state: ForwardState;
   /** 规则创建时间（毫秒），用于稳定排序 */
   createdAt: number;
+  /** 已写入 state.json（重启后自动恢复） */
+  persisted: boolean;
+  /** 随启动 / 登录自动拉起 */
+  autoStart: boolean;
   error?: string;
 }
 
@@ -448,6 +501,7 @@ export const Commands = {
   sshDisconnect: "ssh_disconnect",
   sshListSessions: "ssh_list_sessions",
   sshProbeHostKey: "ssh_probe_host_key",
+  sshPoolStats: "ssh_pool_stats",
   terminalInput: "terminal_input",
   terminalResize: "terminal_resize",
   forwardStart: "forward_start",
@@ -455,6 +509,7 @@ export const Commands = {
   forwardGet: "forward_get",
   forwardList: "forward_list",
   forwardUpdate: "forward_update",
+  forwardRetry: "forward_retry",
   agentSend: "agent_send",
   agentAbort: "agent_abort",
   agentApprove: "agent_approve",

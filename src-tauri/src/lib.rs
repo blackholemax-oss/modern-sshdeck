@@ -27,6 +27,17 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let state = state::AppState::new();
+
+            // 连接复用：起空闲连接回收任务
+            state.sessions.spawn_link_reaper();
+
+            // 转发守护：挂上 AppHandle 后恢复持久化规则（重启后自动拉起）
+            state.supervisor.attach_app(app.handle().clone());
+            let supervisor = state.supervisor.clone();
+            tauri::async_runtime::spawn(async move {
+                supervisor.restore_all().await;
+            });
+
             app.manage(state);
 
             Ok(())
@@ -41,6 +52,7 @@ pub fn run() {
             ipc::ssh_disconnect,
             ipc::ssh_list_sessions,
             ipc::ssh_probe_host_key,
+            ipc::ssh_pool_stats,
             ipc::terminal_input,
             ipc::terminal_resize,
             ipc::fs::fs_list_dir,
@@ -52,6 +64,7 @@ pub fn run() {
             ipc::forward_get,
             ipc::forward_list,
             ipc::forward_update,
+            ipc::forward_retry,
             ipc::agent_send,
             ipc::agent_abort,
             ipc::agent_approve,

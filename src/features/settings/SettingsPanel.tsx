@@ -8,8 +8,8 @@
  *
  * 所有修改都走 `useSettingsStore.patch`，先写后端再回填，保证落盘与界面一致。
  */
-import { useState, type ReactNode } from "react";
-import { X, RotateCcw, Monitor, Moon, Sun, Type } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
+import { X, RotateCcw, Monitor, Moon, RefreshCw, Sun, Type } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,7 +18,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type { AppConfigPatch } from "@/shared/ipc";
+import { cn } from "@/lib/utils";
+import { api } from "@/shared/api";
+import type { AppConfigPatch, PoolStats } from "@/shared/ipc";
 import { useTranslation } from "react-i18next";
 
 import { resolveTheme, useSettingsStore } from "@/stores/settings";
@@ -139,6 +141,10 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                     defaultUsername: "",
                     hostKeyPolicy: "strict",
                     knownHostsPath: "",
+                    sessionReuse: true,
+                    sessionReuseIdleSecs: 300,
+                    forwardAutoRestore: true,
+                    forwardReconnectMaxSecs: 30,
                   },
                 })
               }
@@ -493,6 +499,80 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
 
               <Separator />
 
+              <Section title={t("settings.behavior.reuse")}>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label>{t("settings.behavior.reuseToggle")}</Label>
+                    <Hint>{t("settings.behavior.reuseHint")}</Hint>
+                  </div>
+                  <Switch
+                    checked={behavior?.sessionReuse ?? true}
+                    onCheckedChange={(v) => patchBehavior({ sessionReuse: v })}
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 pt-2">
+                  <div>
+                    <Label className="text-xs">{t("settings.behavior.reuseIdle")}</Label>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={86400}
+                      className="mt-1"
+                      defaultValue={behavior?.sessionReuseIdleSecs ?? 300}
+                      onBlur={(e) => {
+                        const v = Number(e.target.value);
+                        if (
+                          Number.isFinite(v) &&
+                          v >= 0 &&
+                          v <= 86400 &&
+                          v !== behavior?.sessionReuseIdleSecs
+                        ) {
+                          patchBehavior({ sessionReuseIdleSecs: v });
+                        }
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <Label className="text-xs">{t("settings.behavior.forwardReconnectMax")}</Label>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={300}
+                      className="mt-1"
+                      defaultValue={behavior?.forwardReconnectMaxSecs ?? 30}
+                      onBlur={(e) => {
+                        const v = Number(e.target.value);
+                        if (
+                          Number.isFinite(v) &&
+                          v >= 1 &&
+                          v <= 300 &&
+                          v !== behavior?.forwardReconnectMaxSecs
+                        ) {
+                          patchBehavior({ forwardReconnectMaxSecs: v });
+                        }
+                      }}
+                    />
+                  </div>
+                </div>
+                <Hint>{t("settings.behavior.reuseIdleHint")}</Hint>
+
+                <div className="mt-3 flex items-center justify-between">
+                  <div>
+                    <Label>{t("settings.behavior.forwardAutoRestore")}</Label>
+                    <Hint>{t("settings.behavior.forwardAutoRestoreHint")}</Hint>
+                  </div>
+                  <Switch
+                    checked={behavior?.forwardAutoRestore ?? true}
+                    onCheckedChange={(v) => patchBehavior({ forwardAutoRestore: v })}
+                  />
+                </div>
+
+                <LinkStats />
+              </Section>
+
+              <Separator />
+
               <Section title={t("settings.behavior.defaultsForNew")}>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
@@ -689,6 +769,79 @@ function TerminalPreview({
         {"blackholemax@archlinux:~$ "}
         <span style={{ color: "#d4d4d4" }}>█</span>
       </div>
+    </div>
+  );
+}
+
+/**
+ * 链路诊断：展示当前 SSH 连接池。
+ *
+ * 验证复用是否生效：打开同主机第二个标签页后点刷新 —— `handshakes` 不变、
+ * `reuses` +1，且两个会话指向同一个 `linkId`。
+ */
+function LinkStats() {
+  const { t } = useTranslation();
+  const [stats, setStats] = useState<PoolStats | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    setBusy(true);
+    try {
+      setStats(await api.poolStats());
+    } catch {
+      // 诊断信息拿不到不影响设置页使用
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  return (
+    <div className="mt-3 space-y-1 rounded-md border border-border px-2 py-1.5">
+      <div className="flex items-center justify-between">
+        <Label>{t("settings.behavior.poolTitle")}</Label>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-6 px-1.5"
+          title={t("settings.behavior.poolRefresh")}
+          onClick={() => void load()}
+        >
+          <RefreshCw className={cn("size-3", busy && "animate-spin")} />
+        </Button>
+      </div>
+      <div className="text-[11px] text-muted-foreground">
+        {stats
+          ? t("settings.behavior.poolStats", {
+              handshakes: stats.handshakes,
+              reuses: stats.reuses,
+              sessions: stats.sessions,
+            })
+          : "…"}
+      </div>
+      {stats && stats.links.length === 0 ? (
+        <div className="text-[11px] text-muted-foreground">
+          {t("settings.behavior.poolEmpty")}
+        </div>
+      ) : null}
+      {stats?.links.map((l) => (
+        <div
+          key={l.id}
+          className="truncate font-mono text-[10px] text-muted-foreground"
+          title={l.id}
+        >
+          {t("settings.behavior.poolLink", {
+            user: l.username,
+            host: l.host,
+            port: l.port,
+            sessions: l.sessions,
+            reuses: l.reuses,
+          })}
+        </div>
+      ))}
     </div>
   );
 }
