@@ -133,7 +133,9 @@ impl SessionManager {
         self.links.set_idle_ttl(ttl);
         if !enabled {
             let pool = self.links.clone();
-            tokio::spawn(async move {
+            // 用 tauri 的运行时：本函数会在 `setup`（没有 tokio reactor 上下文）里被调用，
+            // 直接 `tokio::spawn` 会 panic "there is no reactor running"。
+            tauri::async_runtime::spawn(async move {
                 pool.close_idle_now().await;
             });
         }
@@ -143,7 +145,8 @@ impl SessionManager {
     /// 后台回收空闲连接（由 `lib.rs` 在 setup 里起一次）。
     pub fn spawn_link_reaper(&self) {
         let pool = self.links.clone();
-        tokio::spawn(async move {
+        // 同上：启动期调用，必须走 tauri 的运行时
+        tauri::async_runtime::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(10));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
