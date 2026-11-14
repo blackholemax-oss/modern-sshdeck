@@ -16,6 +16,8 @@ import {
   LoaderCircle,
   Plus,
   Server,
+  ShieldAlert,
+  ShieldCheck,
   Trash2,
   User,
 } from "lucide-react";
@@ -26,7 +28,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import { api, SshdeckError } from "@/shared/api";
-import type { ConnectRequest, HostProfile } from "@/shared/ipc";
+import { IpcErrorCode, type ConnectRequest, type HostKeyProbe, type HostProfile } from "@/shared/ipc";
 import { useConnectionStore } from "@/stores/connection";
 import { useSettingsStore } from "@/stores/settings";
 import { useSessionsStore, type PaneLayout } from "@/stores/sessions";
@@ -69,6 +71,27 @@ function errorText(err: unknown): string {
   if (err instanceof SshdeckError) return `${err.code}: ${err.message}`;
   if (err instanceof Error) return err.message;
   return String(err);
+}
+
+/**
+ * 「已知主机里没有这台机器」——只有这种情况允许用户看完指纹后一键信任。
+ *
+ * 密钥**变更**（mismatch）与 `@revoked` 绝不能给出一键信任的入口：那正是
+ * 中间人攻击的典型特征，必须让用户去人工核对 known_hosts。
+ */
+function isUnknownHostKey(err: unknown): boolean {
+  return (
+    err instanceof SshdeckError &&
+    err.code === IpcErrorCode.HOST_KEY_ERROR &&
+    err.message.includes("is not in ")
+  );
+}
+
+/** 信任确认卡的数据：记住这次连接请求，用户确认后原样重放。 */
+interface TrustPrompt {
+  request: ConnectRequest;
+  title: string;
+  probe: HostKeyProbe;
 }
 
 function parsePort(raw: string): number | null {
@@ -138,6 +161,8 @@ export function ConnectionsSidebar() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  /** 未知主机密钥的确认卡（strict 策略下首次连接会走到这里） */
+  const [trustPrompt, setTrustPrompt] = useState<TrustPrompt | null>(null);
 
   // 空 pane 请求连接时，自动展开表单（Express 收敛到单一入口）。
   const effectiveFormOpen = formOpen || intent.formOpen;
@@ -172,29 +197,63 @@ export function ConnectionsSidebar() {
     setNotice(t("host.connectedTo", { title }));
   };
 
-  const doConnect = async (req: ConnectRequest, title: string) => {
+  /**
+   * 连接（含「带指纹信任」的重放）。
+   *
+   * `trustedKey` 只在用户于确认卡里点过「信任并连接」时传入：后端会校验
+   * 服务端出示的密钥与它**完全一致**后才写入 known_hosts，避免「确认的指纹」
+   * 与「实际连上的机器」不是同一把密钥。
+   */
+  const doConnect = async (req: ConnectRequest, title: string, trustedKey?: string) => {
     setSubmitting(true);
     setError(null);
     setNotice(null);
     try {
-      const info = await api.connect(req);
+      const info = await api.connect(trustedKey ? { ...req, trustHostKey: trustedKey } : req);
       upsertSession(info);
       placeSession(info.id, title);
       setPromptHostId(null);
       setPromptPassword("");
       setPromptPassphrase("");
+      setTrustPrompt(null);
       setForm(emptyForm);
       return true;
     } catch (err) {
-      setError(errorText(err));
+      if (isUnknownHostKey(err)) {
+        // 未知主机：读一次指纹给用户核对，别让他盲信任
+        setError(errorText(err));
+        try {
+          const probe = await api.probeHostKey(req.host.trim(), req.port);
+          setTrustPrompt({ request: req, title, probe });
+        } catch (probeErr) {
+          setError(t("host.hostKeyProbeFailed", { error: errorText(probeErr) }));
+        }
+      } else if (err instanceof SshdeckError && err.code === IpcErrorCode.HOST_KEY_ERROR) {
+        // 变更 / 吊销：明确告诉用户「已阻止」，不提供一键放行
+        setError(`${t("host.hostKeyMismatch")} — ${err.message}`);
+      } else {
+        setError(errorText(err));
+      }
       return false;
     } finally {
       setSubmitting(false);
     }
   };
 
+  /** 用户核对指纹后点「信任并连接」。 */
+  const handleTrustAndConnect = async () => {
+    if (!trustPrompt) return;
+    const { request, title, probe } = trustPrompt;
+    const ok = await doConnect(request, title, probe.publicKey);
+    if (ok) {
+      setFormOpen(false);
+      useConnectIntent.getState().setFormOpen(false);
+    }
+  };
+
   /** 从主机列表直连（凭据由内联输入提供）。 */
   const handleConnectHost = async (host: HostProfile) => {
+    setTrustPrompt(null);
     const port = host.port;
     const auth =
       host.authType === "key"
@@ -240,6 +299,7 @@ export function ConnectionsSidebar() {
     if (form.authType === "key" && !form.keyPath.trim()) return setError(t("host.errorNoKeyPath2"));
 
     setError(null);
+    setTrustPrompt(null);
     const auth =
       form.authType === "key"
         ? {
@@ -322,6 +382,7 @@ export function ConnectionsSidebar() {
           className="h-7 px-1.5"
           title={t("host.newConnection")}
           onClick={() => {
+            setTrustPrompt(null);
             if (effectiveFormOpen) {
               setFormOpen(false);
               useConnectIntent.getState().setFormOpen(false);
@@ -346,6 +407,56 @@ export function ConnectionsSidebar() {
       {notice ? (
         <div className="mx-2 mb-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-600 dark:text-emerald-400">
           {notice}
+        </div>
+      ) : null}
+
+      {/* 未知主机密钥：核对指纹后再信任（strict 策略的首次连接） */}
+      {trustPrompt ? (
+        <div className="mx-2 mb-2 space-y-1.5 rounded-md border border-amber-500/50 bg-amber-500/10 p-2">
+          <div className="flex items-center gap-1.5 text-[11px] font-medium text-amber-700 dark:text-amber-400">
+            <ShieldAlert className="size-3.5 shrink-0" />
+            <span>{t("host.hostKeyUnknown")}</span>
+          </div>
+          <p className="text-[10px] leading-relaxed text-muted-foreground">
+            {t("host.hostKeyUnknownHint", {
+              host: `${trustPrompt.probe.host}:${trustPrompt.probe.port}`,
+            })}
+          </p>
+          <div className="space-y-0.5 rounded bg-background/60 px-1.5 py-1">
+            <div className="text-[10px] text-muted-foreground">
+              {t("host.hostKeyAlgorithm")}: {trustPrompt.probe.algorithm}
+            </div>
+            <div className="font-mono text-[10px] break-all text-foreground">
+              {trustPrompt.probe.fingerprint}
+            </div>
+          </div>
+          <div className="text-[10px] break-all text-muted-foreground">
+            {t("host.hostKeyRecordPath", { path: trustPrompt.probe.knownHostsPath })}
+          </div>
+          <div className="flex items-center gap-1">
+            <Button
+              size="sm"
+              className="h-6 px-2 text-[11px]"
+              disabled={submitting}
+              onClick={() => void handleTrustAndConnect()}
+            >
+              {submitting ? (
+                <LoaderCircle className="size-3 animate-spin" />
+              ) : (
+                <ShieldCheck className="size-3" />
+              )}
+              {t("host.hostKeyTrust")}
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2 text-[11px]"
+              disabled={submitting}
+              onClick={() => setTrustPrompt(null)}
+            >
+              {t("common.cancel")}
+            </Button>
+          </div>
         </div>
       ) : null}
 

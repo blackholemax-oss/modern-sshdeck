@@ -128,6 +128,18 @@ export const en: Messages = {
     passwordPlaceholder2: "Used for this connection only (or save it to the host profile)",
     deleteHost: "Delete host",
     privateKeyPath: "Private key path",
+    hostKeyUnknown: "Unknown host key",
+    hostKeyUnknownHint:
+      "{{host}} has not been seen before. Verify the fingerprint below through a trusted channel before trusting it.",
+    hostKeyAlgorithm: "Algorithm",
+    hostKeyFingerprint: "Fingerprint",
+    hostKeyRecordPath: "Will be written to {{path}}",
+    hostKeyTrust: "Trust and connect",
+    hostKeyTrustFailed: "Failed to trust host key — {{error}}",
+    hostKeyProbeFailed: "Failed to read host key — {{error}}",
+    hostKeyMismatch:
+      "Host key does not match known_hosts — connection blocked (possible man-in-the-middle attack or re-installed server)",
+    hostKeyRevoked: "This host key is marked @revoked in known_hosts; connection refused",
   },
 
   agent: {
@@ -176,7 +188,7 @@ export const en: Messages = {
   forward: {
     errorLocalPortInt: "Local port must be an integer between 1 and 65535",
     errorRemotePortInt: "Remote port must be an integer between 1 and 65535",
-    startForward: "Start local port forwarding",
+    startForward: "Start port forwarding",
     status: {
       starting: "Starting",
       running: "Running",
@@ -186,20 +198,34 @@ export const en: Messages = {
     errorNoSession: "Open an SSH session first",
     errorLocalPort: "Local port must be between 1 and 65535",
     errorRemotePort: "Remote port must be between 1 and 65535",
-    errorRemoteHost: "Please fill in the remote host",
+    errorRemoteHost: "Please fill in the target host",
+    errorListenHost: "Please fill in the listen address",
+    startFailed: "Forwarding failed to start — open the rule to see why",
     noSessionOption: "(no session available to forward)",
-    addHint: "Add a local port forward",
+    addHint: "Add a port forward",
     noSessionHint: "No session available",
-    stop: "Stop forwarding",
+    stop: "Delete rule (stop forwarding)",
     session: "Session",
     localAddress: "Local address",
     add: "Add forward",
+    refresh: "Refresh rule list",
+    edit: "Edit rule",
+    editing: "Editing",
+    creating: "New rule",
     start: "Add",
     localPort: "Local port",
     remoteHost: "Target host",
     remotePort: "Target port",
     stopped: "Stopped",
     empty: "No forwarding rules",
+    kind: "Type",
+    kindLocal: "Local (-L)",
+    kindRemote: "Remote (-R)",
+    kindLocalHint: "Listen locally, forward to an address reachable from the server",
+    kindRemoteHint: "Listen on the server, forward to an address reachable from your machine",
+    listenHostRemote: "Remote listen address",
+    listenPortRemote: "Remote port",
+    targetHostRemote: "Local target host",
   },
 
   files: {
@@ -277,6 +303,19 @@ export const en: Messages = {
       defaultPort: "Default port",
       defaultUsername: "Default username",
       defaultEmptyHint: "Leave empty to skip",
+      hostKey: "Host key verification",
+      hostKeyPolicy: "Policy",
+      hostKeyStrict: "Strict (recommended)",
+      hostKeyAcceptNew: "Record on first use (TOFU)",
+      hostKeyInsecure: "No verification (insecure)",
+      hostKeyStrictHint:
+        "Only keys already present in known_hosts are accepted; unknown hosts require confirming the fingerprint. Changed keys are always rejected.",
+      hostKeyAcceptNewHint:
+        "New server keys are recorded automatically on first connect; later key changes are still rejected.",
+      hostKeyInsecureHint:
+        "Skips known_hosts verification for troubleshooting only — removes man-in-the-middle protection.",
+      knownHostsPath: "known_hosts path",
+      knownHostsPathHint: "Leave empty to use ~/.ssh/known_hosts",
     },
 
     model: {

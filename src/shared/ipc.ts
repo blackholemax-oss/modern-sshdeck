@@ -26,6 +26,8 @@ export interface IpcError {
 
 export const IpcErrorCode = {
   SSH_ERROR: "SSH_ERROR",
+  /** 主机密钥校验失败（未知 / 变更 / 被 @revoked） */
+  HOST_KEY_ERROR: "HOST_KEY_ERROR",
   FORWARD_ERROR: "FORWARD_ERROR",
   LLM_ERROR: "LLM_ERROR",
   AGENT_ERROR: "AGENT_ERROR",
@@ -137,6 +139,12 @@ export interface UiConfig {
   showAgentPanel: boolean;
 }
 
+/** 主机密钥校验策略（与后端 `HostKeyPolicy` 对应）。 */
+export type HostKeyPolicy = "strict" | "accept_new" | "insecure";
+
+/** 主机密钥与 known_hosts 的比对结果。 */
+export type HostKeyStatus = "match" | "unknown" | "mismatch" | "revoked";
+
 /** 行为类开关。 */
 export interface BehaviorConfig {
   /** 关闭标签前确认 */
@@ -149,6 +157,10 @@ export interface BehaviorConfig {
   defaultPort: number;
   /** 新建连接表单的默认用户名 */
   defaultUsername: string;
+  /** 主机密钥校验策略 */
+  hostKeyPolicy: HostKeyPolicy;
+  /** 自定义 known_hosts 路径；空串 = ~/.ssh/known_hosts */
+  knownHostsPath: string;
 }
 
 export interface AppConfig {
@@ -216,6 +228,13 @@ export interface ConnectRequest {
   auth: AuthSpec;
   cols: number;
   rows: number;
+  /**
+   * 用户在指纹确认卡里点「信任并连接」后带上：服务端公钥的 OpenSSH 文本。
+   *
+   * 只在「未知主机」时生效（写入 known_hosts 后放行）；与已有记录冲突时后端
+   * 仍然拒绝连接。
+   */
+  trustHostKey?: string;
 }
 
 export interface SessionInfo {
@@ -225,22 +244,56 @@ export interface SessionInfo {
   username: string;
   state: SessionState;
   createdAt: number;
-  /** 服务端主机指纹（MVP 仅展示，供人工比对） */
+  /** 服务端主机指纹（SHA256） */
   hostKeyFingerprint?: string;
+  /** 主机密钥校验结果：verified / trusted / learned / insecure */
+  hostKeyStatus?: "verified" | "trusted" | "learned" | "insecure";
+}
+
+/** `ssh_probe_host_key` 返回：只握手不认证，用于未知主机的指纹确认。 */
+export interface HostKeyProbe {
+  host: string;
+  port: number;
+  /** SHA256:... */
+  fingerprint: string;
+  /** ssh-ed25519 / rsa-sha2-256 等 */
+  algorithm: string;
+  /** 完整公钥（原样回传给 `trustHostKey`） */
+  publicKey: string;
+  knownHostsPath: string;
+  policy: HostKeyPolicy;
+  status: HostKeyStatus;
 }
 
 // ───────────────────────────── 端口转发 ─────────────────────────────
 
-/** 本轮仅实现 local；remote / dynamic 为预留值。 */
+/**
+ * `local`（-L）与 `remote`（-R）已实现；`dynamic`（-D / SOCKS）为预留值，
+ * 后端会拒绝并提示。
+ */
 export type ForwardKind = "local" | "remote" | "dynamic";
 
 export interface ForwardRequest {
   sessionId: string;
   kind: ForwardKind;
+  /** -L：本机监听地址；-R：服务端监听地址 */
   listenHost: string;
+  /** -L：本机监听端口；-R：服务端监听端口（0 = 由服务端分配） */
   listenPort: number;
+  /** -L：远端目标地址；-R：本机侧目标地址 */
   remoteHost: string;
+  /** -L：远端目标端口；-R：本机侧目标端口 */
   remotePort: number;
+}
+
+/** 修改规则：只传需要改的字段；运行中的规则会原地重启（保留 id）。 */
+export interface ForwardPatch {
+  sessionId?: string;
+  kind?: ForwardKind;
+  listenHost?: string;
+  listenPort?: number;
+  remoteHost?: string;
+  remotePort?: number;
 }
 
 export interface ForwardInfo {
@@ -252,6 +305,8 @@ export interface ForwardInfo {
   remoteHost: string;
   remotePort: number;
   state: ForwardState;
+  /** 规则创建时间（毫秒），用于稳定排序 */
+  createdAt: number;
   error?: string;
 }
 
@@ -392,11 +447,14 @@ export const Commands = {
   sshConnect: "ssh_connect",
   sshDisconnect: "ssh_disconnect",
   sshListSessions: "ssh_list_sessions",
+  sshProbeHostKey: "ssh_probe_host_key",
   terminalInput: "terminal_input",
   terminalResize: "terminal_resize",
   forwardStart: "forward_start",
   forwardStop: "forward_stop",
+  forwardGet: "forward_get",
   forwardList: "forward_list",
+  forwardUpdate: "forward_update",
   agentSend: "agent_send",
   agentAbort: "agent_abort",
   agentApprove: "agent_approve",

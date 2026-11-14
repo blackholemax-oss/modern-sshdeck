@@ -137,6 +137,8 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                     autoReconnectAttempts: 0,
                     defaultPort: 22,
                     defaultUsername: "",
+                    hostKeyPolicy: "strict",
+                    knownHostsPath: "",
                   },
                 })
               }
@@ -431,6 +433,62 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   }}
                 />
                 <Hint>{t("settings.behavior.autoReconnectHint")}</Hint>
+              </Section>
+
+              <Separator />
+
+              <Section title={t("settings.behavior.hostKey")}>
+                <Select
+                  value={behavior?.hostKeyPolicy ?? "strict"}
+                  onValueChange={(v) =>
+                    patchBehavior({ hostKeyPolicy: v as "strict" | "accept_new" | "insecure" })
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="strict">
+                      {t("settings.behavior.hostKeyStrict")}
+                    </SelectItem>
+                    <SelectItem value="accept_new">
+                      {t("settings.behavior.hostKeyAcceptNew")}
+                    </SelectItem>
+                    <SelectItem value="insecure">
+                      {t("settings.behavior.hostKeyInsecure")}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <Hint>
+                  {behavior?.hostKeyPolicy === "accept_new"
+                    ? t("settings.behavior.hostKeyAcceptNewHint")
+                    : behavior?.hostKeyPolicy === "insecure"
+                      ? t("settings.behavior.hostKeyInsecureHint")
+                      : t("settings.behavior.hostKeyStrictHint")}
+                </Hint>
+                <div className="pt-1">
+                  <Label className="text-xs">{t("settings.behavior.knownHostsPath")}</Label>
+                  <Input
+                    className="mt-1 font-mono text-xs"
+                    placeholder="~/.ssh/known_hosts"
+                    defaultValue={behavior?.knownHostsPath ?? ""}
+                    onBlur={(e) => {
+                      const v = e.target.value.trim();
+                      if (v !== (behavior?.knownHostsPath ?? "")) {
+                        patchBehavior({ knownHostsPath: v });
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        const v = (e.target as HTMLInputElement).value.trim();
+                        if (v !== (behavior?.knownHostsPath ?? "")) {
+                          patchBehavior({ knownHostsPath: v });
+                        }
+                      }
+                    }}
+                  />
+                  <Hint>{t("settings.behavior.knownHostsPathHint")}</Hint>
+                </div>
               </Section>
 
               <Separator />

@@ -65,6 +65,15 @@ pub async fn bridge(
         .unwrap_or_default();
     tracing::debug!(originator, "forward connection established");
 
+    // 转发可能在本条连接建立前就被停止（watch 只在「变化」时唤醒）：
+    // 进场先看一眼当前值，避免 stop 之后才 spawn 的泵一直挂着。
+    if *shutdown.borrow() {
+        let _ = channel.eof().await;
+        let _ = channel.close().await;
+        let _ = local.shutdown().await;
+        return Ok(());
+    }
+
     let mut buf = vec![0u8; 32 * 1024];
     let mut local_eof = false;
 

@@ -26,6 +26,11 @@ impl AppState {
         let persist = PersistStore::new();
         let config = persist.public_config();
         let sessions = Arc::new(SessionManager::new());
+        // 主机密钥校验策略来自用户配置：strict（默认）/ accept_new / insecure
+        sessions.apply_host_key_settings(
+            &config.behavior.host_key_policy,
+            &config.behavior.known_hosts_path,
+        );
         let forwards = Arc::new(ForwardRegistry::new(sessions.clone()));
         let agent = Arc::new(AgentRuntime::new(sessions.clone(), persist.dir().clone()));
 

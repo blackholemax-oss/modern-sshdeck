@@ -10,6 +10,13 @@ pub enum AppError {
     #[error("ssh error: {0}")]
     Ssh(String),
 
+    /// 主机密钥校验失败（未知 / 变更 / 被吊销）。
+    ///
+    /// 单独一个错误码而不是塞进 `Ssh`：前端要据此区分「凭据错」与
+    /// 「可能被中间人攻击」，后者必须用完全不同的话术提示用户。
+    #[error("host key error: {0}")]
+    HostKey(String),
+
     #[error("forward error: {0}")]
     Forward(String),
 
@@ -36,6 +43,7 @@ impl AppError {
     pub fn code(&self) -> &'static str {
         match self {
             AppError::Ssh(_) => "SSH_ERROR",
+            AppError::HostKey(_) => "HOST_KEY_ERROR",
             AppError::Forward(_) => "FORWARD_ERROR",
             AppError::Llm(_) => "LLM_ERROR",
             AppError::Agent(_) => "AGENT_ERROR",
@@ -49,6 +57,7 @@ impl AppError {
     pub fn message(&self) -> String {
         match self {
             AppError::Ssh(m)
+            | AppError::HostKey(m)
             | AppError::Forward(m)
             | AppError::Llm(m)
             | AppError::Agent(m)

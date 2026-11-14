@@ -90,6 +90,7 @@ export function TerminalWorkspace() {
           state: payload.state,
           createdAt: prev?.createdAt ?? Date.now(),
           hostKeyFingerprint: prev?.hostKeyFingerprint,
+          hostKeyStatus: prev?.hostKeyStatus,
         };
         useSessionsStore.getState().upsertSession(info);
       });

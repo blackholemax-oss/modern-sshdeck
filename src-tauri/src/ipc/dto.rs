@@ -179,6 +179,16 @@ pub struct BehaviorConfig {
     pub auto_reconnect_attempts: u32,
     pub default_port: u16,
     pub default_username: String,
+    /// 主机密钥校验策略：`strict`（默认）/ `accept_new` / `insecure`
+    #[serde(default = "default_host_key_policy")]
+    pub host_key_policy: String,
+    /// 自定义 known_hosts 路径；空串 = `~/.ssh/known_hosts`
+    #[serde(default)]
+    pub known_hosts_path: String,
+}
+
+fn default_host_key_policy() -> String {
+    "strict".into()
 }
 
 impl Default for BehaviorConfig {
@@ -189,6 +199,8 @@ impl Default for BehaviorConfig {
             auto_reconnect_attempts: 0,
             default_port: 22,
             default_username: String::new(),
+            host_key_policy: default_host_key_policy(),
+            known_hosts_path: String::new(),
         }
     }
 }
@@ -274,6 +286,8 @@ pub struct BehaviorConfigPatch {
     pub auto_reconnect_attempts: Option<u32>,
     pub default_port: Option<u16>,
     pub default_username: Option<String>,
+    pub host_key_policy: Option<String>,
+    pub known_hosts_path: Option<String>,
 }
 
 // ───────────────────────────── 主机 ─────────────────────────────
@@ -311,6 +325,12 @@ pub struct ConnectRequest {
     pub auth: AuthSpec,
     pub cols: u32,
     pub rows: u32,
+    /// 用户在指纹确认弹层里点「信任」后带上的 OpenSSH 公钥。
+    ///
+    /// 只有「未知主机」会用到它：命中则写入 known_hosts 并放行；
+    /// 与 `known_hosts` 中已有密钥冲突时**永远拒绝**（需要人工处理）。
+    #[serde(default)]
+    pub trust_host_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -324,6 +344,28 @@ pub struct SessionInfo {
     pub created_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_key_fingerprint: Option<String>,
+    /// 主机密钥校验结果：`verified` / `trusted` / `learned` / `insecure`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_key_status: Option<String>,
+}
+
+/// `ssh_probe_host_key` 的返回：只握手不认证，用于「未知主机」的指纹确认。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostKeyProbe {
+    pub host: String,
+    pub port: u16,
+    /// `SHA256:...`
+    pub fingerprint: String,
+    /// `ssh-ed25519` 等
+    pub algorithm: String,
+    /// 完整公钥（前端原样回传给 `ssh_connect` 的 `trustHostKey`）
+    pub public_key: String,
+    pub known_hosts_path: String,
+    /// 当前生效策略
+    pub policy: String,
+    /// 与 known_hosts 的比对结果：`match` / `unknown` / `mismatch` / `revoked`
+    pub status: String,
 }
 
 // ───────────────────────────── 端口转发 ─────────────────────────────
@@ -347,6 +389,21 @@ pub struct ForwardRequest {
     pub remote_port: u16,
 }
 
+/// 修改转发规则时的补丁：只改传入的字段。
+///
+/// 运行中的规则被修改时会**原地重启**（保留 `id`，先释放旧监听 / 取消旧的
+/// `tcpip-forward`，再按新参数重新启动）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForwardPatch {
+    pub session_id: Option<String>,
+    pub kind: Option<ForwardKind>,
+    pub listen_host: Option<String>,
+    pub listen_port: Option<u16>,
+    pub remote_host: Option<String>,
+    pub remote_port: Option<u16>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForwardInfo {
@@ -358,6 +415,8 @@ pub struct ForwardInfo {
     pub remote_host: String,
     pub remote_port: u16,
     pub state: ForwardState,
+    /// 规则创建时间（毫秒），用于稳定排序
+    pub created_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

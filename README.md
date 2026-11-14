@@ -14,11 +14,13 @@
 | 标签内分屏（单屏 / 左右 / 上下 / 四宫格） | ✅ |
 | 密码登录 | ✅ |
 | 私钥登录（OpenSSH，支持 passphrase） | ✅ |
+| 端口转发规则管理（增删改查，改后原地重启） | ✅ |
 | 本地端口转发（`-L`） | ✅ |
+| 远程端口转发（`-R`） | ✅ |
+| SOCKS 动态转发（`-D`） | 未实现（后端明确拒绝） |
+| known_hosts 严格校验（strict / TOFU / insecure，指纹确认） | ✅ |
 | 运维 Agent（OpenAI 兼容 API：DeepSeek / OpenAI / Qwen / vLLM / Ollama） | ✅ |
 | Agent 命令分级审批（只读自动 / 变更与高危需人工确认） | ✅ |
-| 远程转发 `-R` / SOCKS `-D` | 预留（未实现） |
-| known_hosts 严格校验 | 未实现（MVP 展示指纹供人工比对） |
 
 ---
 
@@ -45,8 +47,8 @@
 
 | 模块 | 路径 | 职责 |
 |---|---|---|
-| SSH | `src-tauri/src/ssh/` | 会话建立、认证、shell channel、命令执行 |
-| 转发 | `src-tauri/src/forward/` | 本地监听 → SSH direct-tcpip |
+| SSH | `src-tauri/src/ssh/` | 会话建立、认证、shell channel、命令执行、**known_hosts 严格校验** |
+| 转发 | `src-tauri/src/forward/` | 规则 CRUD + 本地 `-L` / 远程 `-R` 双向泵 |
 | Agent | `src-tauri/src/agent/` | 对话 tool loop、审批闸门 |
 | LLM | `src-tauri/src/llm/` | OpenAI 兼容 SSE 流式 + tool_calls |
 | 安全 | `src-tauri/src/guard/` | 命令风险分级（fail-safe） |
@@ -103,7 +105,7 @@ bash scripts/check.sh test                       # 全部测试
 
 | 类型 | 数量 | 覆盖内容 |
 |---|---|---|
-| 单元测试 | 126 | 命令风险分级（含 `sudo -i`/`su root` 高危判定）、SSE 解析与 `tool_calls` 聚合、tool loop 与审批取消、私钥路径展开、转发地址规范化（含 IPv6）、**设置项持久化与非法值校验** |
+| 单元测试 | 153 | 命令风险分级（含 `sudo -i`/`su root` 高危判定）、SSE 解析与 `tool_calls` 聚合、tool loop 与审批取消、私钥路径展开、转发地址规范化（含 IPv6）、**known_hosts 通配/取反/哈希/吊销与落盘**、**`-R` 来连通道路由匹配**、**设置项持久化与非法值校验** |
 | 端到端集成测试 | 5 | 真实 russh 服务端 + 真实客户端：SSH 握手、host key SHA256 指纹、密码认证（正确/错误）、PTY 尺寸透传、shell 数据往返、direct-tcpip 通道、端口不可达快速失败 |
 | 回归测试 | 2 | PTY `TTY_OP_END` 误用导致的会话立即断开（带超时断言） |
 | 真实数据测试 | 1 | 用真实 `git diff` 断言 RTK 压缩率 > 30% 且不丢变更行 |
@@ -117,9 +119,10 @@ bash scripts/check.sh test                       # 全部测试
 
 1. **添加主机**：左栏「新建连接」→ 填主机/端口/用户名 → 密码或私钥
 2. **打开终端**：点击主机 → 自动开标签；工具栏可切分屏
-3. **端口转发**：左栏下半「新建转发」→ 本地端口 → 远端 host:port
-4. **配置 Agent**：左下角「设置」→ **Agent** 页签 → 填服务地址 / 模型 / API Key
-5. **对话**：右栏输入需求 → Agent 自动调用工具
+3. **端口转发**：左栏下半「＋」→ 选 `-L`（本地监听）/ `-R`（服务端监听）→ 填监听端口与目标 host:port；列表里可编辑（原地重启）或删除
+4. **首次连接的主机密钥**：strict 策略下会先显示指纹，核对后点「信任并连接」写入 known_hosts
+5. **配置 Agent**：左下角「设置」→ **Agent** 页签 → 填服务地址 / 模型 / API Key
+6. **对话**：右栏输入需求 → Agent 自动调用工具
    - 只读命令（`ls`/`df`/`ps`…）→ 直接执行
    - 变更/高危命令 → 弹审批卡片，需你点「允许一次」
 
@@ -234,11 +237,16 @@ MVP 核心链路已实现并通过验证：
 
 未完成项（架构已预留）：
 
-- 远程端口转发 `-R` / SOCKS 动态转发 `-D`（`ForwardKind` 已预留，`Remote`/`Dynamic` 当前返回 `InvalidInput`）
-- known_hosts 严格校验与 TOFU 指纹确认（MVP 接受任意主机，仅展示 SHA256 指纹供人工比对）
+- SOCKS 动态转发 `-D`（`ForwardKind` 已预留 `Dynamic`，后端返回 `InvalidInput`）
 - ssh-agent / 系统钥匙串集成
 - SFTP 文件传输、跳板机 ProxyJump、会话录制回放
 - keyboard-interactive 认证（部分服务器密码走此路径）
+
+已完成（原未完成项）：
+
+- 远程端口转发 `-R`：`tcpip-forward` + `forwarded-tcpip` 路由 + 本机目标双向泵
+- known_hosts 严格校验：`strict`（默认）/ `accept_new`（TOFU）/ `insecure`；
+  未知主机需在前端核对指纹后信任，密钥变更与 `@revoked` 一律拒绝
 
 ### 已修复的关键缺陷（真实主机联调中发现）
 

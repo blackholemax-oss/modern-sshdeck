@@ -85,6 +85,11 @@ export const api = {
     invokeCommand<void>(contract.Commands.sshDisconnect, { sessionId }),
   listSessions: () =>
     invokeCommand<contract.SessionInfo[]>(contract.Commands.sshListSessions),
+  probeHostKey: (host: string, port: number) =>
+    invokeCommand<contract.HostKeyProbe>(contract.Commands.sshProbeHostKey, {
+      host,
+      port,
+    }),
   sendInput: (sessionId: string, data: string) =>
     invokeCommand<void>(contract.Commands.terminalInput, { sessionId, data }),
   resize: (sessionId: string, cols: number, rows: number) =>
@@ -99,8 +104,17 @@ export const api = {
     invokeCommand<contract.ForwardInfo>(contract.Commands.forwardStart, { req }),
   stopForward: (forwardId: string) =>
     invokeCommand<void>(contract.Commands.forwardStop, { forwardId }),
-  listForwards: () =>
-    invokeCommand<contract.ForwardInfo[]>(contract.Commands.forwardList),
+  getForward: (forwardId: string) =>
+    invokeCommand<contract.ForwardInfo>(contract.Commands.forwardGet, { forwardId }),
+  listForwards: (sessionId?: string) =>
+    invokeCommand<contract.ForwardInfo[]>(contract.Commands.forwardList, {
+      sessionId: sessionId ?? null,
+    }),
+  updateForward: (forwardId: string, patch: contract.ForwardPatch) =>
+    invokeCommand<contract.ForwardInfo>(contract.Commands.forwardUpdate, {
+      forwardId,
+      patch,
+    }),
 
   // Agent
   agentSend: (req: contract.AgentSendRequest) =>

@@ -4,6 +4,8 @@
 //! - 独立 tokio task 读 channel，输出经 base64 后 emit `terminal:data`
 //! - 断开时 emit `terminal:closed` + `session:state`(closed)，并从管理器移除
 //! - 独立 exec channel 支持 `run_command`（Agent 工具调用）
+//! - `check_server_key` 里做 known_hosts 严格校验（见 `ssh::known_hosts`）
+//! - `server_channel_open_forwarded_tcpip` 把 `-R` 来连通道交给路由表
 //!
 //! ## russh 0.54 关键事实（已读源码确认，勿按老教程写）
 //! - `client::Handler::check_server_key` 的参数是 `&russh::keys::PublicKey`（ssh-key crate）
@@ -11,11 +13,15 @@
 //! - `ChannelMsg` 只有 `Data` / `ExtendedData` / `Eof` / `Close` / `ExitStatus` /
 //!   `WindowAdjusted` / `Success` / `Failure` / `OpenFailure` 等变体
 //! - `Channel::split()` 得到 `(ChannelReadHalf, ChannelWriteHalf)`
+//! - `Handle::tcpip_forward` 需要 `&mut self`；`cancel_tcpip_forward` 只需 `&self`
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use base64::Engine as _;
+use russh::keys::PublicKey;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, watch, Mutex};
 
@@ -25,6 +31,7 @@ use crate::ipc::events::{
     SessionStateEvent, TerminalClosedEvent, TerminalDataEvent, SESSION_STATE, TERMINAL_CLOSED,
     TERMINAL_DATA,
 };
+use crate::ssh::known_hosts::HostKeyPolicy;
 
 /// shell channel 的写入命令。
 #[derive(Debug)]
@@ -62,25 +69,174 @@ impl ShellHandle {
 
 // ───────────────────────────── russh handler ─────────────────────────────
 
+/// 主机密钥校验的副产物。
+///
+/// `check_server_key` 返回 `false` 时，russh 只会给出一个笼统的 `UnknownKey`；
+/// 具体原因（未知 / 变更 / 被吊销）要经由这个槽带回 `manager`，才能显示给用户。
+#[derive(Debug, Clone, Default)]
+pub struct HostKeyOutcome {
+    pub fingerprint: Option<String>,
+    pub algorithm: Option<String>,
+    /// `verified` / `trusted` / `learned` / `insecure` / `rejected`
+    pub status: Option<String>,
+    /// 拒绝连接的具体原因
+    pub rejection: Option<String>,
+}
+
+/// 服务端为 `-R` 远程转发打开的一条来连通道。
+///
+/// 由 `ClientHandler::server_channel_open_forwarded_tcpip` 生产，
+/// 经 mpsc → 路由器 → 对应的转发任务。
+pub struct ForwardedConn {
+    pub connected_address: String,
+    pub connected_port: u32,
+    pub originator_address: String,
+    pub originator_port: u32,
+    pub channel: russh::Channel<russh::client::Msg>,
+}
+
 /// russh 客户端 handler。
 ///
-/// MVP 策略：**接受任意服务端 host key**（不做 MITM 防护），但在
-/// `check_server_key` 里记录 SHA256 指纹，放进 `SessionInfo::host_key_fingerprint`
-/// 交给 UI，供人工比对。严格 known_hosts 校验不在 MVP 范围（见 ARCHITECTURE §1.2）。
+/// 两件事：
+/// 1. **主机密钥校验**：每次握手按 `HostKeyPolicy` 比对 `known_hosts`；
+///    未知 / 变更 / 被吊销都会被拒绝，除非用户在前端显式确认了指纹
+///    （`trusted_key`，仅对「未知」生效 —— 变更的密钥永远不放行）。
+/// 2. **`-R` 来连通道**：服务端打开 `forwarded-tcpip` 通道时转交给上层路由。
 pub struct ClientHandler {
-    fingerprint: Arc<std::sync::Mutex<Option<String>>>,
+    host: String,
+    port: u16,
+    policy: HostKeyPolicy,
+    known_hosts_path: PathBuf,
+    /// 用户在前端确认过的公钥；命中则写入 known_hosts 并放行。
+    trusted_key: Option<PublicKey>,
+    outcome: Arc<std::sync::Mutex<HostKeyOutcome>>,
+    forwarded_tx: Option<mpsc::UnboundedSender<ForwardedConn>>,
 }
 
 impl ClientHandler {
-    /// 返回 handler 与指纹槽；连接完成后从槽里读取指纹。
-    pub fn new() -> (Self, Arc<std::sync::Mutex<Option<String>>>) {
-        let slot = Arc::new(std::sync::Mutex::new(None));
+    /// 返回 handler 与结果槽；连接完成后从槽里读取指纹 / 拒绝原因。
+    pub fn new(
+        host: String,
+        port: u16,
+        policy: HostKeyPolicy,
+        known_hosts_path: PathBuf,
+        trusted_key: Option<PublicKey>,
+        forwarded_tx: Option<mpsc::UnboundedSender<ForwardedConn>>,
+    ) -> (Self, Arc<std::sync::Mutex<HostKeyOutcome>>) {
+        let slot = Arc::new(std::sync::Mutex::new(HostKeyOutcome::default()));
         (
             Self {
-                fingerprint: slot.clone(),
+                host,
+                port,
+                policy,
+                known_hosts_path,
+                trusted_key,
+                outcome: slot.clone(),
+                forwarded_tx,
             },
             slot,
         )
+    }
+
+    /// 纯决策逻辑（同步 IO，文件很小）：`Ok(status)` 放行，`Err(原因)` 拒绝。
+    fn decide(&self, key: &PublicKey) -> Result<&'static str, String> {
+        let fp = crate::ssh::known_hosts::fingerprint(key);
+        let target = crate::ssh::known_hosts::host_target(&self.host, self.port);
+        let verdict = crate::ssh::known_hosts::verify_file(
+            &self.known_hosts_path,
+            &self.host,
+            self.port,
+            key,
+        )
+        .map_err(|e| {
+            // 读不到 known_hosts 就拒绝 —— 校验失败必须是 fail-closed。
+            format!(
+                "cannot verify host key for {target}: {} (expected known_hosts at {}); \
+                 refusing to connect with key {fp}",
+                e.message(),
+                self.known_hosts_path.display()
+            )
+        })?;
+
+        use crate::ssh::known_hosts::{HostKeyPolicy, HostKeyVerdict};
+
+        match verdict {
+            HostKeyVerdict::Match => Ok("verified"),
+
+            HostKeyVerdict::Revoked { line } => {
+                if self.policy == HostKeyPolicy::Insecure {
+                    tracing::warn!(host = %self.host, port = self.port, line, "revoked host key accepted: insecure policy");
+                    return Ok("insecure");
+                }
+                Err(format!(
+                    "host key for {target} is marked @revoked at {} line {line} (got {fp})",
+                    self.known_hosts_path.display()
+                ))
+            }
+
+            HostKeyVerdict::Mismatch { line } => {
+                if self.policy == HostKeyPolicy::Insecure {
+                    tracing::warn!(host = %self.host, port = self.port, line, "CHANGED host key accepted: insecure policy");
+                    return Ok("insecure");
+                }
+                Err(format!(
+                    "HOST KEY MISMATCH for {target}: {} line {line} records a different key \
+                     (server presented {fp}). This may be a man-in-the-middle attack. \
+                     Refusing to connect; remove the stale line only if you are sure the \
+                     server key was legitimately replaced.",
+                    self.known_hosts_path.display()
+                ))
+            }
+
+            HostKeyVerdict::Unknown => {
+                // ① 用户显式确认过指纹 → 落盘 + 放行
+                if let Some(trusted) = &self.trusted_key {
+                    if trusted.key_data() == key.key_data() {
+                        return match crate::ssh::known_hosts::learn_file(
+                            &self.known_hosts_path,
+                            &self.host,
+                            self.port,
+                            key,
+                        ) {
+                            Ok(()) => Ok("trusted"),
+                            Err(e) => Err(format!(
+                                "host key for {target} was confirmed but could not be saved to {}: {}",
+                                self.known_hosts_path.display(),
+                                e.message()
+                            )),
+                        };
+                    }
+                    return Err(format!(
+                        "pinned host key mismatch for {target}: expected {}, server presented {fp}. \
+                         Refusing to connect.",
+                        crate::ssh::known_hosts::fingerprint(trusted)
+                    ));
+                }
+
+                // ② 策略决定未知主机怎么处理
+                match self.policy {
+                    HostKeyPolicy::AcceptNew => match crate::ssh::known_hosts::learn_file(
+                        &self.known_hosts_path,
+                        &self.host,
+                        self.port,
+                        key,
+                    ) {
+                        Ok(()) => Ok("learned"),
+                        Err(e) => Err(format!(
+                            "host key for {target} is unknown and could not be recorded to {}: {}",
+                            self.known_hosts_path.display(),
+                            e.message()
+                        )),
+                    },
+                    HostKeyPolicy::Insecure => Ok("insecure"),
+                    HostKeyPolicy::Strict => Err(format!(
+                        "host key for {target} is not in {} (got {fp}). \
+                         Confirm the fingerprint in the client before trusting this host.",
+                        self.known_hosts_path.display()
+                    )),
+                }
+            }
+        }
     }
 }
 
@@ -92,13 +248,70 @@ impl russh::client::Handler for ClientHandler {
         server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
         // `HashAlg::Sha256` 是 ssh-key 默认指纹算法，Display 形如 `SHA256:xxxx`。
-        let fp = server_public_key
-            .fingerprint(russh::keys::HashAlg::Sha256)
-            .to_string();
-        if let Ok(mut guard) = self.fingerprint.lock() {
-            *guard = Some(fp);
+        let fingerprint = crate::ssh::known_hosts::fingerprint(server_public_key);
+        let algorithm = server_public_key.algorithm().as_str().to_string();
+        let decision = self.decide(server_public_key);
+
+        let mut guard = self
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.fingerprint = Some(fingerprint);
+        guard.algorithm = Some(algorithm);
+        match decision {
+            Ok(status) => {
+                guard.status = Some(status.to_string());
+                guard.rejection = None;
+                Ok(true)
+            }
+            Err(reason) => {
+                tracing::warn!(reason = %reason, "host key rejected");
+                guard.status = Some("rejected".into());
+                guard.rejection = Some(reason);
+                Ok(false)
+            }
         }
-        Ok(true)
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        let conn = ForwardedConn {
+            connected_address: connected_address.to_string(),
+            connected_port,
+            originator_address: originator_address.to_string(),
+            originator_port,
+            channel,
+        };
+
+        match self.forwarded_tx.as_ref() {
+            Some(tx) => {
+                if let Err(err) = tx.send(conn) {
+                    // 路由已停（用户停止转发 / 会话正在收尾）：礼貌关闭通道
+                    let channel = err.0.channel;
+                    let _ = channel.eof().await;
+                    let _ = channel.close().await;
+                }
+            }
+            None => {
+                // 从未请求过远程转发却收到来连通道：说明服务端行为异常，直接关闭。
+                tracing::warn!(
+                    connected_address,
+                    connected_port,
+                    "unexpected forwarded-tcpip channel with no remote forwarding"
+                );
+                let channel = conn.channel;
+                let _ = channel.eof().await;
+                let _ = channel.close().await;
+            }
+        }
+        Ok(())
     }
 
     async fn auth_banner(
@@ -131,6 +344,8 @@ pub struct SessionEntry {
     /// 之后 `subscribe()` 出来的 receiver 首次 `changed()` 会立即返回 `Err`，
     /// shell task 会瞬间误判会话已关闭并退出（表现为「连上就断」）。
     pub closed_guard: Mutex<watch::Receiver<bool>>,
+    /// `-R` 远程转发的来连通道路由表
+    pub remote_routes: RemoteRouter,
 }
 
 impl SessionEntry {
@@ -146,6 +361,161 @@ impl SessionEntry {
     pub async fn set_state(&self, state: SessionState) {
         self.info.lock().await.state = state;
     }
+}
+
+// ───────────────────────────── `-R` 来连通道分发 ─────────────────────────────
+
+/// 一条远程转发注册的「收货口」。
+struct RemoteRoute {
+    id: u32,
+    listen_host: String,
+    listen_port: u32,
+    tx: mpsc::UnboundedSender<ForwardedConn>,
+}
+
+/// `-R` 路由表：服务端每打开一条 `forwarded-tcpip` 通道，按
+/// `(connected_address, connected_port)` 找到对应的转发任务并投递。
+///
+/// 匹配顺序：
+/// 1. 地址与端口都一致；
+/// 2. 注册时监听的是通配地址（`0.0.0.0` / `::` / 空）→ 同端口即可；
+/// 3. 双方都是回环别名（`localhost` / `127.x` / `::1`）→ 同端口即可；
+/// 4. 同端口只有唯一一条规则 → 直接投递（服务端回报的地址可能是本机网卡 IP）。
+///
+/// 都没有命中时礼貌关闭通道（而不是静默丢弃，避免服务端半开连接堆积）。
+#[derive(Default)]
+pub struct RemoteRouter {
+    routes: Mutex<Vec<RemoteRoute>>,
+    next_id: AtomicU32,
+}
+
+impl RemoteRouter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 注册一条远程转发，返回用于注销的路由 id。
+    pub async fn register(
+        &self,
+        listen_host: &str,
+        listen_port: u32,
+        tx: mpsc::UnboundedSender<ForwardedConn>,
+    ) -> u32 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.routes.lock().await.push(RemoteRoute {
+            id,
+            listen_host: listen_host.to_string(),
+            listen_port,
+            tx,
+        });
+        id
+    }
+
+    pub async fn unregister(&self, route_id: u32) {
+        self.routes.lock().await.retain(|r| r.id != route_id);
+    }
+
+    /// 投递一条来连通道；无路由时关闭通道。
+    pub async fn dispatch(&self, conn: ForwardedConn) {
+        let target = {
+            let routes = self.routes.lock().await;
+            pick_route(&routes, &conn.connected_address, conn.connected_port).map(|r| r.tx.clone())
+        };
+
+        match target {
+            Some(tx) => {
+                if let Err(err) = tx.send(conn) {
+                    let channel = err.0.channel;
+                    let _ = channel.eof().await;
+                    let _ = channel.close().await;
+                }
+            }
+            None => {
+                tracing::debug!(
+                    connected_address = %conn.connected_address,
+                    connected_port = conn.connected_port,
+                    "no remote forward route for incoming channel; closing"
+                );
+                let channel = conn.channel;
+                let _ = channel.eof().await;
+                let _ = channel.close().await;
+            }
+        }
+    }
+}
+
+fn pick_route<'a>(
+    routes: &'a [RemoteRoute],
+    connected_address: &str,
+    connected_port: u32,
+) -> Option<&'a RemoteRoute> {
+    // ① 地址 + 端口完全一致
+    if let Some(route) = routes.iter().find(|r| {
+        r.listen_port == connected_port && r.listen_host.eq_ignore_ascii_case(connected_address)
+    }) {
+        return Some(route);
+    }
+    // ② 监听通配地址
+    if let Some(route) = routes.iter().find(|r| {
+        r.listen_port == connected_port && is_wildcard_host(&r.listen_host)
+    }) {
+        return Some(route);
+    }
+    // ③ 回环别名
+    if let Some(route) = routes.iter().find(|r| {
+        r.listen_port == connected_port
+            && is_loopback_host(&r.listen_host)
+            && is_loopback_host(connected_address)
+    }) {
+        return Some(route);
+    }
+    // ④ 同端口唯一
+    let mut same_port = routes.iter().filter(|r| r.listen_port == connected_port);
+    match (same_port.next(), same_port.next()) {
+        (Some(route), None) => Some(route),
+        _ => None,
+    }
+}
+
+fn is_wildcard_host(host: &str) -> bool {
+    matches!(host.trim(), "" | "*" | "0.0.0.0" | "::" | "[::]")
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']').trim();
+    h.eq_ignore_ascii_case("localhost")
+        || h == "::1"
+        || h == "0:0:0:0:0:0:0:1"
+        || h.strip_prefix("127.").is_some_and(|rest| !rest.is_empty())
+}
+
+/// 起「来连通道 → 路由表」的分发任务。
+///
+/// 生命周期与会话一致：会话 `closed` 变 true 或通道发送端全部 drop 时退出。
+pub fn spawn_forwarded_router(
+    entry: Arc<SessionEntry>,
+    mut rx: mpsc::UnboundedReceiver<ForwardedConn>,
+) {
+    let router_entry = entry.clone();
+    tokio::spawn(async move {
+        let mut closed = router_entry.closed.subscribe();
+        loop {
+            tokio::select! {
+                changed = closed.changed() => {
+                    match changed {
+                        Ok(()) => { if *closed.borrow() { break } }
+                        Err(_) => break,
+                    }
+                }
+                msg = rx.recv() => {
+                    match msg {
+                        Some(conn) => router_entry.remote_routes.dispatch(conn).await,
+                        None => break,
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// 会话表：管理器与各个 task 共享。
@@ -397,4 +767,62 @@ pub async fn collect_output(
         }
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route(listen_host: &str, listen_port: u32) -> RemoteRoute {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        RemoteRoute {
+            id: listen_port,
+            listen_host: listen_host.to_string(),
+            listen_port,
+            tx,
+        }
+    }
+
+    #[test]
+    fn route_matches_exact_address_first() {
+        let routes = vec![route("127.0.0.1", 9000), route("10.0.0.5", 9000)];
+        let hit = pick_route(&routes, "10.0.0.5", 9000).expect("exact match");
+        assert_eq!(hit.listen_host, "10.0.0.5");
+    }
+
+    #[test]
+    fn route_matches_wildcard_listen_address() {
+        let routes = vec![route("0.0.0.0", 9000)];
+        assert!(pick_route(&routes, "192.168.1.7", 9000).is_some());
+        assert!(pick_route(&routes, "192.168.1.7", 9001).is_none());
+    }
+
+    #[test]
+    fn route_matches_loopback_aliases() {
+        let routes = vec![route("localhost", 9000)];
+        assert!(pick_route(&routes, "127.0.0.1", 9000).is_some());
+        assert!(pick_route(&routes, "::1", 9000).is_some());
+    }
+
+    #[test]
+    fn route_falls_back_to_unique_port() {
+        let routes = vec![route("10.0.0.5", 9000)];
+        // 服务端回报的地址与请求不同（例如被 NAT / 网卡地址替换）
+        assert!(pick_route(&routes, "203.0.113.9", 9000).is_some());
+
+        // 同端口两条规则时不做猜测
+        let ambiguous = vec![route("10.0.0.5", 9000), route("10.0.0.6", 9000)];
+        assert!(pick_route(&ambiguous, "203.0.113.9", 9000).is_none());
+    }
+
+    #[test]
+    fn host_helpers() {
+        assert!(is_wildcard_host(""));
+        assert!(is_wildcard_host("::"));
+        assert!(!is_wildcard_host("127.0.0.1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("127.0.0.2"));
+        assert!(!is_loopback_host("10.0.0.1"));
+    }
 }

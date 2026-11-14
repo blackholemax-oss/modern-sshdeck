@@ -11,25 +11,61 @@
 //! ```
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use russh::keys::PublicKey;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::error::{AppError, AppResult};
-use crate::ipc::dto::{AuthSpec, ConnectRequest, SessionInfo, SessionState};
+use crate::ipc::dto::{AuthSpec, ConnectRequest, HostKeyProbe, SessionInfo, SessionState};
 use crate::ipc::events::{SessionStateEvent, SESSION_STATE};
 use crate::ssh::auth;
 use crate::ssh::config::SshOptions;
+use crate::ssh::known_hosts::{self, HostKeyPolicy};
 use crate::ssh::session::{
-    collect_output, open_exec_channel, spawn_shell_tasks, ChannelCommand, ClientHandler,
-    SessionEntry, SessionMap, ShellHandle, ShellTasks,
+    collect_output, open_exec_channel, spawn_forwarded_router, spawn_shell_tasks, ChannelCommand,
+    ClientHandler, ForwardedConn, RemoteRouter, SessionEntry, SessionMap, ShellHandle, ShellTasks,
 };
+
+/// 主机密钥校验设置（可随配置热更新）。
+#[derive(Debug, Clone)]
+pub struct HostKeySettings {
+    pub policy: HostKeyPolicy,
+    pub known_hosts_path: PathBuf,
+}
+
+impl Default for HostKeySettings {
+    fn default() -> Self {
+        Self {
+            policy: HostKeyPolicy::default(),
+            known_hosts_path: known_hosts::default_path(),
+        }
+    }
+}
+
+impl HostKeySettings {
+    /// 从配置值构造：策略非法值回落到默认（strict），空路径用默认位置。
+    pub fn from_config(policy: &str, path: &str) -> Self {
+        let trimmed = path.trim();
+        Self {
+            policy: HostKeyPolicy::parse(policy).unwrap_or_default(),
+            known_hosts_path: if trimmed.is_empty() {
+                known_hosts::default_path()
+            } else {
+                auth::expand_path(trimmed)
+            },
+        }
+    }
+}
 
 pub struct SessionManager {
     sessions: SessionMap,
     options: SshOptions,
+    /// `RwLock` 而非 Mutex：连接建立时高频读取，写只在改设置时发生。
+    host_key: std::sync::RwLock<HostKeySettings>,
 }
 
 impl SessionManager {
@@ -37,6 +73,28 @@ impl SessionManager {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             options: SshOptions::default(),
+            host_key: std::sync::RwLock::new(HostKeySettings::default()),
+        }
+    }
+
+    /// 应用设置面板里的主机密钥策略 / known_hosts 路径（只影响之后建立的连接）。
+    pub fn apply_host_key_settings(&self, policy: &str, known_hosts_path: &str) {
+        let next = HostKeySettings::from_config(policy, known_hosts_path);
+        tracing::info!(
+            policy = next.policy.as_str(),
+            path = %next.known_hosts_path.display(),
+            "host key policy updated"
+        );
+        match self.host_key.write() {
+            Ok(mut guard) => *guard = next,
+            Err(poisoned) => *poisoned.into_inner() = next,
+        }
+    }
+
+    pub fn host_key_settings(&self) -> HostKeySettings {
+        match self.host_key.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
@@ -44,7 +102,7 @@ impl SessionManager {
     ///
     /// 步骤：
     /// 1. TCP connect（受 `SshOptions::connect_timeout` 约束）
-    /// 2. russh 握手；接受任意 host key，但记录 SHA256 指纹
+    /// 2. russh 握手；按 `HostKeyPolicy` 严格比对 `known_hosts`
     /// 3. 认证（密码 / 私钥，私钥支持 passphrase）
     /// 4. `channel_open_session` → `request_pty` → `request_shell`
     /// 5. 起读/写 task；emit `session:state` = connected
@@ -103,15 +161,48 @@ impl SessionManager {
 
         let _ = stream.set_nodelay(true);
 
-        // ── 2. russh 握手 ─────────────────────────────────────
+        // ── 2. russh 握手（含 known_hosts 严格校验）────────────
         let mut config = russh::client::Config::default();
         config.keepalive_interval = self.options.keepalive;
         let config = Arc::new(config);
 
-        let (handler, fp_slot) = ClientHandler::new();
-        let mut handle = russh::client::connect_stream(config, stream, handler)
-            .await
-            .map_err(|e| AppError::Ssh(format!("ssh handshake failed: {e}")))?;
+        let host_key_settings = self.host_key_settings();
+        // 用户在前端确认过的公钥：只对「未知」有效，「变更」永远拒绝。
+        let trusted_key = match req.trust_host_key.as_deref().map(str::trim) {
+            Some(raw) if !raw.is_empty() => Some(PublicKey::from_openssh(raw).map_err(|e| {
+                AppError::InvalidInput(format!("trustHostKey is not a valid OpenSSH public key: {e}"))
+            })?),
+            _ => None,
+        };
+
+        // `-R` 来连通道：handler 生产、路由器消费
+        let (forwarded_tx, forwarded_rx) = mpsc::unbounded_channel::<ForwardedConn>();
+
+        let (handler, outcome_slot) = ClientHandler::new(
+            req.host.clone(),
+            req.port,
+            host_key_settings.policy,
+            host_key_settings.known_hosts_path.clone(),
+            trusted_key,
+            Some(forwarded_tx),
+        );
+
+        let mut handle = match russh::client::connect_stream(config, stream, handler).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                // `check_server_key` 返回 false 时 russh 只会报 `UnknownKey`，
+                // 真正的原因（未知 / 变更 / 被吊销 / 文件读失败）在结果槽里。
+                let rejection = outcome_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .rejection
+                    .clone();
+                return Err(match rejection {
+                    Some(reason) => AppError::HostKey(reason),
+                    None => AppError::Ssh(format!("ssh handshake failed: {e}")),
+                });
+            }
+        };
 
         let _ = app.emit(
             SESSION_STATE,
@@ -195,7 +286,10 @@ impl SessionManager {
         };
 
         // ── 5. 组装条目 + 起 task ─────────────────────────────
-        let fingerprint = fp_slot.lock().ok().and_then(|g| g.clone());
+        let outcome = outcome_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
 
         let info = SessionInfo {
             id: session_id.clone(),
@@ -204,7 +298,8 @@ impl SessionManager {
             username: req.username.clone(),
             state: SessionState::Connected,
             created_at: crate::persist::store::now_millis(),
-            host_key_fingerprint: fingerprint,
+            host_key_fingerprint: outcome.fingerprint.clone(),
+            host_key_status: outcome.status.clone(),
         };
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ChannelCommand>(64);
@@ -218,6 +313,7 @@ impl SessionManager {
             handle: Mutex::new(handle),
             closed: closed_tx,
             closed_guard: Mutex::new(closed_rx),
+            remote_routes: RemoteRouter::new(),
         });
 
         // **先入表再起 task**：读任务在通道结束时会把自身从表中移除，
@@ -226,6 +322,9 @@ impl SessionManager {
             .lock()
             .await
             .insert(session_id.clone(), entry.clone());
+
+        // `-R` 来连通道的分发任务（无远程转发时它只是空跑等待）
+        spawn_forwarded_router(entry.clone(), forwarded_rx);
 
         let tasks: ShellTasks = spawn_shell_tasks(
             app.clone(),
@@ -368,6 +467,72 @@ impl SessionManager {
         entry.shell.resize(cols, rows).await
     }
 
+    /// 只做握手、不做认证，取回服务端出示的主机公钥。
+    ///
+    /// 用途：strict 策略下首次连接会被拒绝，前端拿到指纹让用户确认后再带
+    /// `trustHostKey` 重连 —— 这样「信任」永远是用户看过指纹后显式做出的动作，
+    /// 而不是登录失败后盲目重试。
+    pub async fn probe_host_key(&self, host: &str, port: u16) -> AppResult<HostKeyProbe> {
+        let host = host.trim();
+        if host.is_empty() {
+            return Err(AppError::InvalidInput("host is required".into()));
+        }
+        if port == 0 {
+            return Err(AppError::InvalidInput("port must not be 0".into()));
+        }
+
+        let addr = format!("{host}:{port}");
+        let stream = tokio::time::timeout(
+            self.options.connect_timeout,
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| AppError::Ssh(format!("tcp connect {addr} timed out")))?
+        .map_err(|e| AppError::Ssh(format!("tcp connect {addr} failed: {e}")))?;
+
+        let config = Arc::new(russh::client::Config::default());
+        let slot: Arc<std::sync::Mutex<Option<PublicKey>>> = Arc::new(std::sync::Mutex::new(None));
+        let handler = ProbeHandler { key: slot.clone() };
+
+        let handle = tokio::time::timeout(
+            self.options.connect_timeout,
+            russh::client::connect_stream(config, stream, handler),
+        )
+        .await
+        .map_err(|_| AppError::Ssh(format!("ssh handshake with {addr} timed out")))?
+        .map_err(|e| AppError::Ssh(format!("ssh handshake with {addr} failed: {e}")))?;
+
+        let key = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| AppError::Ssh(format!("{addr} did not present a host key")))?;
+
+        // 握手已完成，主动断开，避免把只用于取指纹的连接留在服务端
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.disconnect(russh::Disconnect::ByApplication, "host key probe", "en"),
+        )
+        .await;
+
+        let settings = self.host_key_settings();
+        let verdict = known_hosts::verify_file(&settings.known_hosts_path, host, port, &key)?;
+        let public_key = key
+            .to_openssh()
+            .map_err(|e| AppError::Ssh(format!("encode host key failed: {e}")))?;
+
+        Ok(HostKeyProbe {
+            host: host.to_string(),
+            port,
+            fingerprint: known_hosts::fingerprint(&key),
+            algorithm: key.algorithm().as_str().to_string(),
+            public_key,
+            known_hosts_path: settings.known_hosts_path.display().to_string(),
+            policy: settings.policy.as_str().to_string(),
+            status: verdict.status().to_string(),
+        })
+    }
+
     /// Agent 工具调用：在同一 SSH 连接上开**独立 exec channel** 执行命令。
     ///
     /// - 不影响交互 shell（不同 channel）
@@ -419,6 +584,26 @@ impl SessionManager {
         entry.set_state(state).await;
         // 事件广播需要 AppHandle，这里只做状态落库；事件由调用方 emit。
         let _ = reason;
+    }
+}
+
+/// 只用于「取主机公钥」的探针 handler：记录密钥后放行，不做认证。
+struct ProbeHandler {
+    key: Arc<std::sync::Mutex<Option<PublicKey>>>,
+}
+
+impl russh::client::Handler for ProbeHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKey,
+    ) -> Result<bool, Self::Error> {
+        *self
+            .key
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(server_public_key.clone());
+        Ok(true)
     }
 }
 

@@ -19,18 +19,21 @@
 | G2 | 标签内分屏 | 一个标签内最多 2x2 分屏，每个分屏独立 SSH 会话 |
 | G3 | 密码登录 | 用户名 + 密码可登录真实主机 |
 | G4 | 私钥登录 | 支持 OpenSSH 私钥文件 + passphrase |
-| G5 | 本地端口转发 | `-L` 语义：本地端口 → 远端地址，可启停，状态可见 |
+| G5 | 端口转发 | `-L` / `-R` 语义；规则可增删改查（查询、修改后原地重启），状态可见 |
+| G5b | 主机密钥校验 | 严格比对 `known_hosts`；未知主机需确认指纹，密钥变更一律拒绝 |
 | G6 | Agent 对话面板 | 接入 OpenAI 兼容 API（base_url / api_key / model 可配） |
 | G7 | Agent 工具调用 | Agent 可执行只读命令（自动），写/高危命令需人工确认 |
 | G8 | 双平台构建 | Windows 本地可编译运行；Linux 提供构建脚本与说明 |
 
 ### 1.2 非目标（本轮不做，但架构预留）
 
-- 远程端口转发 `-R`、SOCKS 动态转发 `-D`（预留 `ForwardKind` 枚举，本轮仅实现 `Local`）
+- SOCKS 动态转发 `-D`（`ForwardKind` 已预留 `Dynamic`，后端明确拒绝并提示）
 - ssh-agent / 系统钥匙串（凭据落盘位置见 §7，接口预留 `CredentialStore`）
-- known_hosts 严格校验与 TOFU 指纹确认（MVP 默认接受，UI 显示指纹供人工比对；接口预留 `HostKeyPolicy`）
 - SFTP 文件传输、跳板机 ProxyJump、会话录制回放
 - 团队协作 / 云端同步
+
+> 已完成（原非目标）：远程端口转发 `-R`（§4.4）、known_hosts 严格校验与指纹确认
+> （§4.8，策略 `strict` / `accept_new` / `insecure`）。
 
 ### 1.3 关键架构决策（ADR 摘要）
 
@@ -144,14 +147,16 @@ src-tauri/
     │   └── events.rs        # 事件名常量 + payload struct（Lead）
     ├── ssh/
     │   ├── mod.rs
-    │   ├── manager.rs       # SessionManager: 创建/销毁/列举
-    │   ├── session.rs       # 单个 russh session + channel task
+    │   ├── manager.rs       # SessionManager: 创建/销毁/列举、主机密钥探针
+    │   ├── session.rs       # 单个 russh session + channel task + `-R` 路由
+    │   ├── known_hosts.rs   # known_hosts 严格校验（策略 / 通配 / 哈希 / 吊销）
     │   ├── auth.rs          # 密码 / 私钥认证
     │   └── config.rs        # SSH 配置（超时、算法偏好）
     ├── forward/
     │   ├── mod.rs
-    │   ├── local.rs         # 本地监听 → SSH direct-tcpip
-    │   └── registry.rs      # ForwardRegistry: 启停/状态
+    │   ├── local.rs         # 本地监听 → SSH direct-tcpip（bridge 双向泵）
+    │   ├── remote.rs        # tcpip-forward 请求 / 撤销、本机目标连接
+    │   └── registry.rs      # ForwardRegistry: 规则增删改查 + 状态
     ├── agent/
     │   ├── mod.rs
     │   ├── runtime.rs       # 对话循环（tool loop）
@@ -177,6 +182,7 @@ src-tauri/
 // error.rs
 pub enum AppError {
     Ssh(String),          // 连接/认证/通道错误
+    HostKey(String),      // 主机密钥校验失败（未知 / 变更 / @revoked）
     Forward(String),      // 监听/转发错误
     Llm(String),          // provider 错误
     Agent(String),        // agent 循环错误
@@ -190,6 +196,7 @@ impl AppError {
     pub fn code(&self) -> &'static str {
         match self {
             AppError::Ssh(_) => "SSH_ERROR",
+            AppError::HostKey(_) => "HOST_KEY_ERROR",
             AppError::Forward(_) => "FORWARD_ERROR",
             AppError::Llm(_) => "LLM_ERROR",
             AppError::Agent(_) => "AGENT_ERROR",
@@ -222,16 +229,32 @@ Shell ──channel close / EOF──> Closed
 - 会话断开时 emit `terminal:closed`，前端据此置灰标签并保留滚动内容
 - **必须**处理 `WindowChange`（resize）与 `Eof`/`Close`
 
-### 4.4 本地端口转发
+### 4.4 端口转发（`-L` / `-R`）与规则 CRUD
 
 ```
-本地 TCP listener (127.0.0.1:L) ──accept──> 每条连接:
-    SSH direct-tcpip("<remote_host>:<remote_port>") ──> 双向 copy
+-L: 本地 TCP listener (127.0.0.1:L) ──accept──> 每条连接:
+        SSH direct-tcpip("<remote_host>:<remote_port>") ──> 双向 copy
+
+-R: SSH tcpip-forward("<remote_host>:<remote_port>")
+        服务端来连 ──> forwarded-tcpip channel ──> 本机连 "<remote_host>:<remote_port>"
+        ──> 双向 copy（复用同一个 bridge）
 ```
 
-- 每条本地连接建立独立 SSH channel（`channel_open_direct_tcpip`）
-- 监听任务与 SSH 会话生命周期绑定；会话断开时自动终止转发并 emit `forward:stopped`
-- 端口占用 → `AppError::Forward("listen failed: …")`，前端展示
+- **规则模型**：`ForwardRegistry` 持有 `HashMap<forwardId, ForwardEntry>`。
+  每条规则 = `ForwardInfo`（含 `createdAt` 用于稳定排序）+ 一个可重启实例。
+  CRUD：`forward_start`（增）、`forward_list` / `forward_get`（查）、
+  `forward_update`（改，原地重启并保留 id）、`forward_stop`（删）。
+- **修改语义**：先停旧实例（释放本地监听 / `cancel-tcpip-forward`）再按新参数启动。
+  新参数启动失败时规则**不丢**，保留为 `state = failed` 并带 `error`。
+- **epoch 防竞态**：每次（重）启动自增 `epoch`，旧实例收尾时只有仍是当班实例
+  才允许写状态 / emit，避免「update 后显示已停止」。
+- `-L` 每条连接独立 SSH channel（`channel_open_direct_tcpip`）。
+- `-R` 由 `ClientHandler::server_channel_open_forwarded_tcpip` 收通道 →
+  `SessionEntry::remote_routes` 按 `(connected_address, connected_port)` 分发
+  （兼容通配监听 / 回环别名 / 端口唯一兜底）；无路由时礼貌关闭通道。
+- 实例与 SSH 会话生命周期绑定；会话断开时自动停止并 emit `forward:state = stopped`。
+- 端口占用 → `AppError::Forward("listen failed: …")`；服务端拒绝
+  `tcpip-forward` → 提示检查 `AllowTcpForwarding` / `GatewayPorts`。
 
 ### 4.5 Agent Runtime（tool loop）
 
@@ -303,6 +326,35 @@ pub struct AppState {
 }
 ```
 
+### 4.8 主机密钥校验（known_hosts）
+
+握手阶段由 `ClientHandler::check_server_key` 强制校验，**失败即断开**，不存在
+「先连上再说」的路径。
+
+```
+server host key ──> known_hosts 校验 ──┬─ Match      ──> 放行（status = verified）
+                                      ├─ Unknown    ──┬─ 策略 strict   ──> 拒绝（HOST_KEY_ERROR）
+                                      │              ├─ 策略 accept_new ──> 写入 + 放行（learned）
+                                      │              ├─ 策略 insecure  ──> 放行（insecure）
+                                      │              └─ 用户确认指纹（trustHostKey 命中）──> 写入 + 放行（trusted）
+                                      ├─ Mismatch   ──> 一律拒绝（insecure 除外，且记 WARN）
+                                      └─ Revoked    ──> 一律拒绝（insecure 除外，且记 WARN）
+```
+
+- 解析/匹配在 `ssh/known_hosts.rs`：`[host]:port`、`*`/`?` 通配、`!` 取反、
+  `|1|salt|hash`（HMAC-SHA1）、`@revoked`；逐行返回行号，错误信息可直接定位。
+- **密钥变更（Mismatch）不可一键信任**：前端只会对「未知」给出
+  「信任并连接」，变更必须人工核对 known_hosts。
+- 「信任」是**指纹绑定**的：`ssh_probe_host_key` 只握手不认证，返回指纹与完整公钥；
+  前端确认后把它作为 `ConnectRequest.trustHostKey` 回传，后端只有在服务端出示的
+  密钥与之**完全一致**时才写盘放行，避免「确认的指纹 ≠ 实际连上的机器」。
+- 未知主机在 strict 下会先返回 `HOST_KEY_ERROR`（信息里带 `is not in …`），
+  前端据此走确认卡。
+- 读 known_hosts 失败视为校验失败（fail-closed）。
+- 配置：`behavior.hostKeyPolicy`（默认 `strict`）+ `behavior.knownHostsPath`
+  （空 = `~/.ssh/known_hosts`，支持 `~/` 展开）；改完立即对后续连接生效。
+- 环境变量 `SSHDECK_KNOWN_HOSTS` 可覆盖默认路径（测试 / 便携场景）。
+
 ---
 
 ## 5. IPC 契约（前端 ↔ 后端）
@@ -318,14 +370,17 @@ pub struct AppState {
 | `hosts_list` | — | `HostProfile[]` | 主机列表 |
 | `hosts_upsert` | `{host}` | `HostProfile` | 新增/更新 |
 | `hosts_delete` | `{id}` | `()` | 删除 |
-| `ssh_connect` | `ConnectRequest` | `SessionInfo` | 建立会话 |
+| `ssh_connect` | `ConnectRequest` | `SessionInfo` | 建立会话（可带 `trustHostKey` 确认指纹） |
 | `ssh_disconnect` | `{sessionId}` | `()` | 断开 |
 | `ssh_list_sessions` | — | `SessionInfo[]` | 列举 |
+| `ssh_probe_host_key` | `{host, port}` | `HostKeyProbe` | 只握手取主机公钥（指纹确认用） |
 | `terminal_input` | `{sessionId, data}` | `()` | 键盘输入 |
 | `terminal_resize` | `{sessionId, cols, rows}` | `()` | 尺寸变更 |
-| `forward_start` | `ForwardRequest` | `ForwardInfo` | 启动转发 |
-| `forward_stop` | `{forwardId}` | `()` | 停止 |
-| `forward_list` | — | `ForwardInfo[]` | 列举 |
+| `forward_start` | `ForwardRequest` | `ForwardInfo` | 新增规则并启动（`-L` / `-R`） |
+| `forward_stop` | `{forwardId}` | `()` | 删除规则并停止 |
+| `forward_get` | `{forwardId}` | `ForwardInfo` | 查询单条规则（含失败原因） |
+| `forward_list` | `{sessionId?}` | `ForwardInfo[]` | 列举（可按会话过滤，按 `createdAt` 排序） |
+| `forward_update` | `{forwardId, patch}` | `ForwardInfo` | 修改规则（原地重启，保留 id） |
 | `agent_send` | `{runId, sessionId, message}` | `()` | 发起/继续对话 |
 | `agent_abort` | `{runId}` | `()` | 中止 |
 | `agent_approve` | `{approvalId, approved}` | `()` | 审批工具调用 |
@@ -371,6 +426,8 @@ export interface ConnectRequest {
   auth: AuthSpec;
   cols: number;
   rows: number;
+  /** 用户确认过的服务端公钥（OpenSSH 文本），仅对「未知主机」生效 */
+  trustHostKey?: string;
 }
 
 export type AuthSpec =
@@ -384,17 +441,39 @@ export interface SessionInfo {
   username: string;
   state: SessionState;
   createdAt: number;
+  hostKeyFingerprint?: string;
+  hostKeyStatus?: "verified" | "trusted" | "learned" | "insecure";
 }
 
-export type ForwardKind = "local"; // 预留 remote | dynamic
+export interface HostKeyProbe {
+  host: string;
+  port: number;
+  fingerprint: string;   // SHA256:...
+  algorithm: string;     // ssh-ed25519 / rsa-sha2-256 ...
+  publicKey: string;     // 回传给 trustHostKey
+  knownHostsPath: string;
+  policy: "strict" | "accept_new" | "insecure";
+  status: "match" | "unknown" | "mismatch" | "revoked";
+}
+
+export type ForwardKind = "local" | "remote" | "dynamic"; // dynamic 未实现（后端拒绝）
 
 export interface ForwardRequest {
   sessionId: string;
   kind: ForwardKind;
-  listenHost: string;   // 默认 127.0.0.1
-  listenPort: number;
-  remoteHost: string;
+  listenHost: string;   // -L 本机监听 / -R 服务端监听；默认 127.0.0.1
+  listenPort: number;   // 0 = 由系统 / 服务端分配
+  remoteHost: string;   // -L 远端目标 / -R 本机目标
   remotePort: number;
+}
+
+export interface ForwardPatch {
+  sessionId?: string;
+  kind?: ForwardKind;
+  listenHost?: string;
+  listenPort?: number;
+  remoteHost?: string;
+  remotePort?: number;
 }
 
 export interface ForwardInfo {
@@ -406,6 +485,7 @@ export interface ForwardInfo {
   remoteHost: string;
   remotePort: number;
   state: "starting" | "running" | "stopped" | "failed";
+  createdAt: number;    // 毫秒，用于稳定排序
   error?: string;
 }
 
@@ -421,6 +501,13 @@ export interface AppConfig {
   };
   terminal: { fontSize: number; scrollback: number };
   ui: { theme: "dark" | "light" };
+  behavior: {
+    /** 主机密钥校验策略 */
+    hostKeyPolicy: "strict" | "accept_new" | "insecure";
+    /** 空串 = ~/.ssh/known_hosts */
+    knownHostsPath: string;
+    // …其余行为开关见 src/shared/ipc.ts
+  };
 }
 ```
 

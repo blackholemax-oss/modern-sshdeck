@@ -28,6 +28,12 @@ pub async fn app_set_config(
 ) -> AppResult<AppConfig> {
     let updated = state.persist.apply_patch(config)?;
     *state.config.lock().await = updated.clone();
+    // 主机密钥策略 / known_hosts 路径是「连接期生效」的，改完立刻同步给会话管理器，
+    // 否则要重启应用才生效（用户会以为设置没保存）。
+    state.sessions.apply_host_key_settings(
+        &updated.behavior.host_key_policy,
+        &updated.behavior.known_hosts_path,
+    );
     Ok(updated)
 }
 
@@ -73,6 +79,16 @@ pub async fn ssh_disconnect(state: State<'_, AppState>, session_id: String) -> A
     state.sessions.close(&session_id).await
 }
 
+/// 只握手不认证，取回服务端主机公钥（strict 策略下「未知主机」的指纹确认用）。
+#[tauri::command]
+pub async fn ssh_probe_host_key(
+    state: State<'_, AppState>,
+    host: String,
+    port: u16,
+) -> AppResult<HostKeyProbe> {
+    state.sessions.probe_host_key(&host, port).await
+}
+
 #[tauri::command]
 pub async fn ssh_list_sessions(state: State<'_, AppState>) -> AppResult<Vec<SessionInfo>> {
     Ok(state.sessions.list().await)
@@ -109,13 +125,44 @@ pub async fn forward_start(
 }
 
 #[tauri::command]
-pub async fn forward_stop(state: State<'_, AppState>, forward_id: String) -> AppResult<()> {
-    state.forwards.stop(&forward_id).await
+pub async fn forward_stop(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    forward_id: String,
+) -> AppResult<()> {
+    state.forwards.stop(app, &forward_id).await
 }
 
+/// 查询单条规则（运行期最新状态 + 失败原因）。
 #[tauri::command]
-pub async fn forward_list(state: State<'_, AppState>) -> AppResult<Vec<ForwardInfo>> {
-    Ok(state.forwards.list().await)
+pub async fn forward_get(
+    state: State<'_, AppState>,
+    forward_id: String,
+) -> AppResult<ForwardInfo> {
+    state.forwards.get(&forward_id).await
+}
+
+/// 列举规则；传 `sessionId` 时只返回该会话名下的规则。
+#[tauri::command]
+pub async fn forward_list(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+) -> AppResult<Vec<ForwardInfo>> {
+    Ok(state
+        .forwards
+        .list(session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .await)
+}
+
+/// 修改规则：原地重启并保留 `id`。
+#[tauri::command]
+pub async fn forward_update(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    forward_id: String,
+    patch: ForwardPatch,
+) -> AppResult<ForwardInfo> {
+    state.forwards.update(app, &forward_id, patch).await
 }
 
 // ───────────────────────────── Agent ─────────────────────────────

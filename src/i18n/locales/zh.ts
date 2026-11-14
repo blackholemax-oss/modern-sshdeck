@@ -131,6 +131,18 @@ export const zh = {
     passwordPlaceholder2: "仅本次连接使用（也可保存到本地配置）",
     deleteHost: "删除主机",
     privateKeyPath: "私钥路径",
+    hostKeyUnknown: "未知主机密钥",
+    hostKeyUnknownHint:
+      "首次连接 {{host}}，该主机的指纹还没有记录。请通过可信渠道核对下面的指纹，确认无误后再信任。",
+    hostKeyAlgorithm: "算法",
+    hostKeyFingerprint: "指纹",
+    hostKeyRecordPath: "确认后将写入 {{path}}",
+    hostKeyTrust: "信任并连接",
+    hostKeyTrustFailed: "信任主机密钥失败 — {{error}}",
+    hostKeyProbeFailed: "读取主机密钥失败 — {{error}}",
+    hostKeyMismatch:
+      "主机密钥与 known_hosts 中记录的不一致，已阻止连接（可能是中间人攻击或服务端重装）",
+    hostKeyRevoked: "该主机密钥已被 known_hosts 标记为 @revoked，连接被拒绝",
   },
 
   agent: {
@@ -179,7 +191,7 @@ export const zh = {
   forward: {
     errorLocalPortInt: "本地端口必须是 1–65535 的整数",
     errorRemotePortInt: "远端端口必须是 1–65535 的整数",
-    startForward: "启动本地端口转发",
+    startForward: "启动端口转发",
     status: {
       starting: "启动中",
       running: "运行中",
@@ -189,20 +201,34 @@ export const zh = {
     errorNoSession: "请先建立一个 SSH 会话",
     errorLocalPort: "本地端口必须在 1–65535 之间",
     errorRemotePort: "远端端口必须在 1–65535 之间",
-    errorRemoteHost: "请填写远端主机",
+    errorRemoteHost: "请填写目标主机",
+    errorListenHost: "请填写监听地址",
+    startFailed: "转发启动失败，展开规则可查看原因",
     noSessionOption: "（暂无可转发会话）",
-    addHint: "添加本地端口转发",
+    addHint: "新增端口转发",
     noSessionHint: "没有可用会话",
-    stop: "停止转发",
+    stop: "删除规则（停止转发）",
     session: "会话",
     localAddress: "本地地址",
     add: "新增转发",
+    refresh: "刷新规则列表",
+    edit: "编辑规则",
+    editing: "编辑中",
+    creating: "新建",
     start: "添加",
     localPort: "本地端口",
     remoteHost: "目标主机",
     remotePort: "目标端口",
     stopped: "已停止",
     empty: "暂无转发规则",
+    kind: "类型",
+    kindLocal: "本地 (-L)",
+    kindRemote: "远程 (-R)",
+    kindLocalHint: "本地监听，连到远端可访问的地址",
+    kindRemoteHint: "服务端监听，连到你本机可访问的地址",
+    listenHostRemote: "远端监听地址",
+    listenPortRemote: "远端端口",
+    targetHostRemote: "本机目标地址",
   },
 
   files: {
@@ -280,6 +306,19 @@ export const zh = {
       defaultPort: "默认端口",
       defaultUsername: "默认用户名",
       defaultEmptyHint: "留空则不填充",
+      hostKey: "主机密钥校验",
+      hostKeyPolicy: "校验策略",
+      hostKeyStrict: "严格（推荐）",
+      hostKeyAcceptNew: "首次自动记录（TOFU）",
+      hostKeyInsecure: "不校验（不安全）",
+      hostKeyStrictHint:
+        "只接受 known_hosts 中已记录的密钥；未知主机会先要求确认指纹。密钥变更一律拒绝。",
+      hostKeyAcceptNewHint:
+        "首次连接自动记录服务端密钥；之后密钥一旦变化仍会拒绝连接。",
+      hostKeyInsecureHint:
+        "跳过已知主机校验，仅用于临时排障；会失去中间人攻击防护。",
+      knownHostsPath: "known_hosts 路径",
+      knownHostsPathHint: "留空使用 ~/.ssh/known_hosts",
     },
 
     model: {

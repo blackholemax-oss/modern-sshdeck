@@ -31,6 +31,10 @@ russh = { version = "0.54", default-features = false, features = ["ring", "rsa"]
 dirs = "6"
 rand = "0.9"
 russh-sftp = "3.0.1"
+# known_hosts 中的哈希主机名（|1|salt|hash）用 HMAC-SHA1 校验，
+# 与 OpenSSH 的 HashKnownHosts 行为保持一致。
+hmac = "0.12"
+sha1 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

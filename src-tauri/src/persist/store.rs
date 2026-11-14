@@ -71,6 +71,16 @@ struct PersistedConfig {
     behavior_default_port: u16,
     #[serde(default)]
     behavior_default_username: String,
+    /// 主机密钥校验策略：strict / accept_new / insecure
+    #[serde(default = "default_host_key_policy")]
+    behavior_host_key_policy: String,
+    /// 自定义 known_hosts 路径；空 = 默认 `~/.ssh/known_hosts`
+    #[serde(default)]
+    behavior_known_hosts_path: String,
+}
+
+fn default_host_key_policy() -> String {
+    "strict".into()
 }
 
 fn default_cursor_style() -> String {
@@ -121,6 +131,8 @@ impl Default for PersistedConfig {
             behavior_auto_reconnect_attempts: 0,
             behavior_default_port: default_port(),
             behavior_default_username: String::new(),
+            behavior_host_key_policy: default_host_key_policy(),
+            behavior_known_hosts_path: String::new(),
         }
     }
 }
@@ -229,6 +241,8 @@ impl PersistStore {
                 auto_reconnect_attempts: c.behavior_auto_reconnect_attempts,
                 default_port: c.behavior_default_port,
                 default_username: c.behavior_default_username,
+                host_key_policy: c.behavior_host_key_policy,
+                known_hosts_path: c.behavior_known_hosts_path,
             },
         }
     }
@@ -421,6 +435,21 @@ impl PersistStore {
             if let Some(v) = b.default_username {
                 st.config.behavior_default_username = v.trim().to_string();
             }
+            if let Some(v) = b.host_key_policy {
+                // 非法策略不写入：宁可保持原值，也不能悄悄退化成 insecure
+                if let Some(policy) = crate::ssh::known_hosts::HostKeyPolicy::parse(&v) {
+                    st.config.behavior_host_key_policy = policy.as_str().to_string();
+                }
+            }
+            if let Some(v) = b.known_hosts_path {
+                let trimmed = v.trim();
+                // 只做基本健壮性检查：非空时长度上限 + 不含换行
+                if trimmed.is_empty() {
+                    st.config.behavior_known_hosts_path.clear();
+                } else if trimmed.chars().count() <= 512 && !trimmed.contains('\n') {
+                    st.config.behavior_known_hosts_path = trimmed.to_string();
+                }
+            }
         }
 
         self.write_json(&self.state_path(), &st, false)?;
@@ -534,7 +563,57 @@ mod tests {
 
         assert_eq!(cfg.behavior.default_port, 22);
         assert!(cfg.behavior.confirm_on_close_tab);
+        // 安全默认值：出厂必须是 strict，且 known_hosts 用系统默认位置
+        assert_eq!(cfg.behavior.host_key_policy, "strict");
+        assert_eq!(cfg.behavior.known_hosts_path, "");
         assert!(!cfg.llm.has_api_key);
+    }
+
+    #[test]
+    fn host_key_policy_roundtrip_and_validation() {
+        let store = temp_store("hostkey");
+
+        store
+            .apply_patch(AppConfigPatch {
+                behavior: Some(BehaviorConfigPatch {
+                    host_key_policy: Some("accept_new".into()),
+                    known_hosts_path: Some("  ~/.ssh/known_hosts_test  ".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .expect("apply");
+
+        let cfg = store.public_config();
+        assert_eq!(cfg.behavior.host_key_policy, "accept_new");
+        assert_eq!(cfg.behavior.known_hosts_path, "~/.ssh/known_hosts_test");
+
+        // 非法策略必须被忽略（保持原值），不能悄悄退化成 insecure
+        store
+            .apply_patch(AppConfigPatch {
+                behavior: Some(BehaviorConfigPatch {
+                    host_key_policy: Some("garbage".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .expect("apply");
+        assert_eq!(store.public_config().behavior.host_key_policy, "accept_new");
+
+        // 带换行的路径拒绝写入
+        store
+            .apply_patch(AppConfigPatch {
+                behavior: Some(BehaviorConfigPatch {
+                    known_hosts_path: Some("bad\npath".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .expect("apply");
+        assert_eq!(
+            store.public_config().behavior.known_hosts_path,
+            "~/.ssh/known_hosts_test"
+        );
     }
 
     #[test]
