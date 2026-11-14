@@ -209,6 +209,7 @@ export const en: Messages = {
     localAddress: "Local address",
     add: "Add forward",
     refresh: "Refresh rule list",
+    actions: "More actions",
     edit: "Edit rule",
     editing: "Editing",
     creating: "New rule",

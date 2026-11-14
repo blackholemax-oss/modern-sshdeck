@@ -6,7 +6,8 @@
  * - 增：表单内选 `local(-L)` / `remote(-R)`，启动走 `api.startForward`。
  * - 改：同一表单进入编辑模式，走 `api.updateForward(id, patch)`（后端原地重启，
  *   保留 id；失败时规则仍保留为 `failed`，不会丢）。
- * - 删：停止按钮 → `api.stopForward`，成功后从本地列表移除。
+ * - 删：行内操作菜单（每条规则一个可展开按钮，内含「编辑 / 删除」）
+ *   → `api.stopForward`，成功后从本地列表移除。
  *
  * 订阅 `forward:state` 就地更新状态（含 failed 的 error 文本）；会话关闭时
  * 后端会把状态置为 stopped，这里只做展示降级。
@@ -15,6 +16,7 @@ import { useEffect, useState } from "react";
 import {
   ArrowLeftRight,
   ArrowRight,
+  ChevronDown,
   ChevronUp,
   LoaderCircle,
   Network,
@@ -119,9 +121,31 @@ export function ForwardPanel() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** 展开中的行内操作菜单（规则 id）；同一时刻只允许一个 */
+  const [menuId, setMenuId] = useState<string | null>(null);
 
   const patchForm = (patch: Partial<ForwardForm>) =>
     setForm((prev) => ({ ...prev, ...patch }));
+
+  // 行内菜单：点外部 / 按 Esc 收起。用 pointerdown 而非 click，
+  // 这样点另一个规则的操作按钮时是先关旧菜单再开新菜单，不会互相打架。
+  useEffect(() => {
+    if (!menuId) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest(`[data-forward-menu="${menuId}"]`)) return;
+      setMenuId(null);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenuId(null);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menuId]);
 
   /** 拉取规则列表（查询）。 */
   const refresh = async (silent = false) => {
@@ -462,10 +486,17 @@ export function ForwardPanel() {
           const badge = STATE_BADGE[f.state];
           const busy = busyId === f.id;
           const remote = f.kind === "remote";
+          const menuOpen = menuId === f.id;
           return (
             <div
               key={f.id}
-              className="rounded-md border border-transparent px-2 py-1.5 transition-colors hover:border-border hover:bg-accent/40"
+              data-forward-menu={f.id}
+              className={cn(
+                "rounded-md border px-2 py-1.5 transition-colors",
+                menuOpen
+                  ? "border-border bg-accent/40"
+                  : "border-transparent hover:border-border hover:bg-accent/40",
+              )}
             >
               <div className="flex items-center gap-1.5">
                 <Badge
@@ -486,31 +517,59 @@ export function ForwardPanel() {
                 >
                   {t(badge.labelKey)}
                 </Badge>
+                {/* 编辑 / 删除合并为一个可展开的操作按钮 */}
                 <Button
                   size="sm"
                   variant="ghost"
-                  className="size-5 shrink-0 p-0 text-muted-foreground hover:text-foreground"
-                  title={t("forward.edit")}
+                  className={cn(
+                    "size-5 shrink-0 p-0 text-muted-foreground hover:text-foreground",
+                    menuOpen && "bg-accent text-foreground",
+                  )}
+                  title={t("forward.actions")}
+                  aria-haspopup="menu"
+                  aria-expanded={menuOpen}
                   disabled={busy}
-                  onClick={() => void startEdit(f.id)}
+                  onClick={() => setMenuId(menuOpen ? null : f.id)}
                 >
                   {busy ? (
                     <LoaderCircle className="size-3 animate-spin" />
                   ) : (
-                    <Pencil className="size-3" />
+                    <ChevronDown
+                      className={cn("size-3.5 transition-transform", menuOpen && "rotate-180")}
+                    />
                   )}
                 </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="size-5 shrink-0 p-0 text-muted-foreground hover:text-destructive"
-                  title={t("forward.stop")}
-                  disabled={busy}
-                  onClick={() => void handleStop(f.id)}
-                >
-                  <Power className="size-3" />
-                </Button>
               </div>
+
+              {menuOpen ? (
+                <div role="menu" className="mt-1 space-y-0.5 border-t border-border/70 pt-1">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[11px] text-foreground hover:bg-accent"
+                    onClick={() => {
+                      setMenuId(null);
+                      void startEdit(f.id);
+                    }}
+                  >
+                    <Pencil className="size-3 shrink-0 text-muted-foreground" />
+                    <span className="min-w-0 truncate">{t("forward.edit")}</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[11px] text-destructive hover:bg-destructive/10"
+                    onClick={() => {
+                      setMenuId(null);
+                      void handleStop(f.id);
+                    }}
+                  >
+                    <Power className="size-3 shrink-0" />
+                    <span className="min-w-0 truncate">{t("forward.stop")}</span>
+                  </button>
+                </div>
+              ) : null}
+
               {f.state === "failed" && f.error ? (
                 <div className="mt-0.5 truncate text-[10px] text-destructive" title={f.error}>
                   {f.error}

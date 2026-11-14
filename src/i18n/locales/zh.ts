@@ -212,6 +212,7 @@ export const zh = {
     localAddress: "本地地址",
     add: "新增转发",
     refresh: "刷新规则列表",
+    actions: "更多操作",
     edit: "编辑规则",
     editing: "编辑中",
     creating: "新建",
